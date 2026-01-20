@@ -382,6 +382,13 @@ impl StrategyEngine {
             (OrderType::Limit, Some(limit_price), TimeInForce::PostOnly)
         };
 
+        // ✅ Pass symbol specs to order for precision validation
+        let (qty_step, tick_size) = if let Some(ref specs) = self.current_specs {
+            (Some(specs.qty_step), Some(specs.tick_size))
+        } else {
+            (None, None)
+        };
+
         let order = Order {
             symbol: orderbook.symbol.clone(),
             side,
@@ -390,6 +397,8 @@ impl StrategyEngine {
             price,
             time_in_force,
             reduce_only: false,
+            qty_step,
+            tick_size,
         };
 
         // ✅ FIXED: Don't set position optimistically - wait for exchange confirmation

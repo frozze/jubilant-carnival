@@ -108,8 +108,8 @@ impl MarketDataActor {
                                     error!("Failed to unsubscribe from {}: {}", old_symbol, e);
                                 }
 
-                                // Notify strategy to close positions
-                                let _ = self.strategy_tx.send(StrategyMessage::SymbolChanged(new_symbol.clone())).await;
+                                // Notify strategy is handled by Scanner now
+                                // let _ = self.strategy_tx.send(StrategyMessage::SymbolChanged(new_symbol.clone())).await;
                             }
 
                             // Subscribe to new symbol

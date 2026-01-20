@@ -56,6 +56,7 @@ async fn main() -> Result<()> {
         client.clone(),
         config.clone(),
         market_data_cmd_tx.clone(),
+        strategy_tx.clone(),
     );
 
     // Initialize MarketDataActor

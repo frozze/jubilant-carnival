@@ -1,6 +1,6 @@
-use crate::actors::messages::MarketDataMessage;
+use crate::actors::messages::{MarketDataMessage, StrategyMessage};
 use crate::config::Config;
-use crate::exchange::BybitClient;
+use crate::exchange::{BybitClient, SpecsCache, SymbolSpecs};
 use crate::models::Symbol;
 use anyhow::Result;
 use std::sync::Arc;
@@ -13,6 +13,8 @@ pub struct ScannerActor {
     client: BybitClient,
     config: Arc<Config>,
     market_data_tx: mpsc::Sender<MarketDataMessage>,
+    strategy_tx: mpsc::Sender<StrategyMessage>,
+    specs_cache: SpecsCache,
     current_symbol: Option<Symbol>,
     current_score: f64,
 }
@@ -22,11 +24,14 @@ impl ScannerActor {
         client: BybitClient,
         config: Arc<Config>,
         market_data_tx: mpsc::Sender<MarketDataMessage>,
+        strategy_tx: mpsc::Sender<StrategyMessage>,
     ) -> Self {
         Self {
             client,
             config,
             market_data_tx,
+            strategy_tx,
+            specs_cache: SpecsCache::new(),
             current_symbol: None,
             current_score: 0.0,
         }
@@ -152,6 +157,23 @@ impl ScannerActor {
                     top_coin.symbol, self.current_score, top_coin.score
                 );
 
+                // Fetch instrument specs if not cached
+                let specs = if let Some(cached) = self.specs_cache.get(&top_coin.symbol) {
+                    cached
+                } else {
+                    match self.client.get_instrument_info(&top_coin.symbol).await {
+                        Ok(info) => {
+                            let specs = SymbolSpecs::from(info);
+                            self.specs_cache.insert(specs.clone());
+                            specs
+                        }
+                        Err(e) => {
+                            warn!("⚠️ Failed to fetch specs for {}: {}, using defaults", top_coin.symbol, e);
+                            self.specs_cache.get_or_default(&top_coin.symbol)
+                        }
+                    }
+                };
+
                 self.current_symbol = Some(Symbol(top_coin.symbol.clone()));
                 self.current_score = top_coin.score;
 
@@ -164,6 +186,18 @@ impl ScannerActor {
                     .await
                 {
                     error!("Failed to send symbol switch message: {}", e);
+                }
+                
+                // Send specs to StrategyEngine
+                if let Err(e) = self
+                    .strategy_tx
+                    .send(StrategyMessage::SymbolChanged { 
+                        symbol: Symbol(top_coin.symbol.clone()),
+                        specs 
+                    })
+                    .await
+                {
+                    error!("Failed to send symbol specs to strategy: {}", e);
                 }
             } else {
                 info!("✅ Current coin {} still optimal", self.current_symbol.as_ref().unwrap());

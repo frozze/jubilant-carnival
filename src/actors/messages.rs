@@ -1,4 +1,5 @@
 use crate::models::*;
+use crate::exchange::SymbolSpecs;
 
 /// Messages between actors
 
@@ -24,8 +25,8 @@ pub enum StrategyMessage {
     Trade(TradeTick),
     /// Position update from execution
     PositionUpdate(Option<Position>),
-    /// Symbol switched, close all positions
-    SymbolChanged(Symbol),
+    /// Symbol switched with new specs
+    SymbolChanged { symbol: Symbol, specs: SymbolSpecs },
 
     // ✅ CRITICAL: Feedback from execution to prevent order spam
     /// Order successfully placed and filled

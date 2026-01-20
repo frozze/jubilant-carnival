@@ -1,5 +1,6 @@
 use crate::actors::messages::{ExecutionMessage, StrategyMessage};
 use crate::config::Config;
+use crate::exchange::SymbolSpecs;
 use crate::models::*;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -20,6 +21,7 @@ pub struct StrategyEngine {
     current_symbol: Option<Symbol>,
     current_position: Option<Position>,
     last_orderbook: Option<OrderBookSnapshot>,
+    current_specs: Option<SymbolSpecs>,
 
     // Tick buffer for momentum calculation
     tick_buffer: RingBuffer<TradeTick>,
@@ -45,6 +47,7 @@ impl StrategyEngine {
             current_symbol: None,
             current_position: None,
             last_orderbook: None,
+            current_specs: None,
             tick_buffer: RingBuffer::new(100),
             momentum_threshold: 0.001, // 0.1% momentum threshold
             order_in_progress: false,
@@ -70,8 +73,8 @@ impl StrategyEngine {
                         StrategyMessage::PositionUpdate(position) => {
                             self.current_position = position;
                         }
-                        StrategyMessage::SymbolChanged(new_symbol) => {
-                            self.handle_symbol_change(new_symbol).await;
+                        StrategyMessage::SymbolChanged { symbol: new_symbol, specs } => {
+                            self.handle_symbol_change(new_symbol, specs).await;
                         }
                         // ✅ CRITICAL: Feedback from execution
                         StrategyMessage::OrderFilled(symbol) => {
@@ -105,8 +108,9 @@ impl StrategyEngine {
         }
     }
 
-    async fn handle_symbol_change(&mut self, new_symbol: Symbol) {
-        info!("🔄 Symbol changed to: {}", new_symbol);
+    async fn handle_symbol_change(&mut self, new_symbol: Symbol, specs: SymbolSpecs) {
+        info!("🔄 Symbol changed to: {} (qty_step={}, tick_size={})", 
+              new_symbol, specs.qty_step, specs.tick_size);
 
         // Close any existing position
         if let Some(ref position) = self.current_position {
@@ -123,9 +127,9 @@ impl StrategyEngine {
 
         // Reset state
         self.current_symbol = Some(new_symbol);
+        self.current_specs = Some(specs);
         self.current_position = None;
         self.last_orderbook = None;
-        self.tick_buffer = RingBuffer::new(100);
         self.tick_buffer = RingBuffer::new(100);
         self.order_in_progress = false; // ✅ Reset order lock
         self.last_order_time = None;
@@ -302,8 +306,8 @@ impl StrategyEngine {
             price,
             time_in_force,
             reduce_only: false,
-            qty_step: orderbook.qty_step.clone(),
-            tick_size: orderbook.tick_size.clone(),
+            qty_step: self.current_specs.as_ref().map(|s| s.qty_step),
+            tick_size: self.current_specs.as_ref().map(|s| s.tick_size),
         };
 
         // ✅ FIXED: Don't set position optimistically - wait for exchange confirmation

@@ -26,7 +26,6 @@ impl BybitClient {
             .tcp_nodelay(true) // Disable Nagle's algorithm for low latency
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .pool_max_idle_per_host(10) // Connection pooling
-            .http2_prior_knowledge() // Use HTTP/2 if available
             .build()
             .expect("Failed to create HTTP client");
 

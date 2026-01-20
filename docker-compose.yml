@@ -1,6 +1,6 @@
 services:
   bot:
-    build: .
+    image: ghcr.io/frozze/jubilant-carnival:latest
     container_name: bybit-scalper
     network_mode: host
     restart: unless-stopped

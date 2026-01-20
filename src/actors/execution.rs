@@ -118,6 +118,8 @@ impl ExecutionActor {
                         price: None,
                         time_in_force: TimeInForce::IOC,
                         reduce_only: true,
+                        qty_step: None,  // Market order, precision not critical
+                        tick_size: None,
                     };
 
                     info!(

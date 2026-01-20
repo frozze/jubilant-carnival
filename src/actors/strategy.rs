@@ -302,6 +302,8 @@ impl StrategyEngine {
             price,
             time_in_force,
             reduce_only: false,
+            qty_step: orderbook.qty_step.clone(),
+            tick_size: orderbook.tick_size.clone(),
         };
 
         // ✅ FIXED: Don't set position optimistically - wait for exchange confirmation

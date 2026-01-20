@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use hmac::{Hmac, Mac};
 use reqwest::Client;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Sha256;
@@ -9,6 +10,14 @@ use tracing::{debug, error, warn};
 type HmacSha256 = Hmac<Sha256>;
 
 const RECV_WINDOW: &str = "5000";
+
+/// Round a value to the nearest step (e.g., round 4.977 to step 0.1 = 4.9)
+fn round_to_step(value: Decimal, step: Decimal) -> Decimal {
+    if step.is_zero() {
+        return value;
+    }
+    (value / step).floor() * step
+}
 
 #[derive(Clone)]
 pub struct BybitClient {
@@ -105,14 +114,53 @@ impl BybitClient {
         }
     }
 
+    /// GET /v5/market/instruments-info
+    /// Fetch instrument specifications (qtyStep, tickSize, minOrderQty)
+    pub async fn get_instrument_info(&self, symbol: &str) -> Result<InstrumentInfo> {
+        let url = format!("{}/v5/market/instruments-info", self.base_url);
+
+        let response = self
+            .client
+            .get(&url)
+            .query(&[("category", "linear"), ("symbol", symbol)])
+            .send()
+            .await
+            .context("Failed to send instruments-info request")?;
+
+        if response.status().is_success() {
+            let data: ApiResponse<InstrumentsResponse> = response
+                .json()
+                .await
+                .context("Failed to parse instruments-info response")?;
+
+            if data.ret_code == 0 {
+                if let Some(instrument) = data.result.list.into_iter().next() {
+                    return Ok(instrument);
+                } else {
+                    anyhow::bail!("No instrument info found for {}", symbol);
+                }
+            } else {
+                anyhow::bail!("API error: {} - {}", data.ret_code, data.ret_msg);
+            }
+        } else {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("HTTP error {}: {}", status, body);
+        }
+    }
+
     /// POST /v5/order/create
     /// CRITICAL: For POST requests, the signature MUST be calculated on the EXACT JSON body sent
     pub async fn place_order(&self, order: &crate::models::Order) -> Result<PlaceOrderResponse> {
         let timestamp = chrono::Utc::now().timestamp_millis();
         let url = format!("{}/v5/order/create", self.base_url);
 
-        // Round qty to 2 decimal places (standard for most perpetual pairs)
-        let qty_rounded = order.qty.round_dp(2);
+        // Round qty based on instrument's qtyStep, fallback to 2 decimals
+        let qty_rounded = if let Some(qty_step) = &order.qty_step {
+            round_to_step(order.qty, *qty_step)
+        } else {
+            order.qty.round_dp(2)
+        };
         
         // Build JSON payload
         let mut payload = json!({
@@ -124,9 +172,13 @@ impl BybitClient {
             "timeInForce": format!("{:?}", order.time_in_force),
         });
 
-        // Add optional fields - round price to 4 decimals
+        // Add optional fields - round price based on instrument's tickSize
         if let Some(price) = order.price {
-            let price_rounded = price.round_dp(4);
+            let price_rounded = if let Some(tick_size) = &order.tick_size {
+                round_to_step(price, *tick_size)
+            } else {
+                price.round_dp(4)
+            };
             payload["price"] = json!(price_rounded.to_string());
         }
 
@@ -355,6 +407,33 @@ pub struct PositionInfo {
     pub size: String,
     pub avg_price: String,
     pub unrealised_pnl: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InstrumentsResponse {
+    pub list: Vec<InstrumentInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstrumentInfo {
+    pub symbol: String,
+    pub lot_size_filter: LotSizeFilter,
+    pub price_filter: PriceFilter,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LotSizeFilter {
+    pub qty_step: String,
+    pub min_order_qty: String,
+    pub max_order_qty: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PriceFilter {
+    pub tick_size: String,
 }
 
 #[cfg(test)]

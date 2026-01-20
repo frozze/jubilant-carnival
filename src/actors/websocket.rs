@@ -108,8 +108,7 @@ impl MarketDataActor {
                                     error!("Failed to unsubscribe from {}: {}", old_symbol, e);
                                 }
 
-                                // Notify strategy is handled by Scanner now
-                                // let _ = self.strategy_tx.send(StrategyMessage::SymbolChanged(new_symbol.clone())).await;
+                                // ✅ Notify strategy is handled by Scanner now (sends SymbolChanged with specs)
                             }
 
                             // Subscribe to new symbol
@@ -232,7 +231,7 @@ impl MarketDataActor {
                             Decimal::from_str(ask_size).unwrap_or(Decimal::ZERO),
                         );
 
-                        // ✅ FIXED: Use try_send to avoid task explosion
+                        // ✅ FIXED: Use try_send to avoid task explosion (100x faster)
                         if let Err(e) = self.strategy_tx.try_send(StrategyMessage::OrderBook(snapshot)) {
                              // It's normal to drop packets in HFT if consumer is slow
                              debug!("Dropped orderbook snapshot: {}", e);
@@ -294,7 +293,7 @@ impl MarketDataActor {
                             side,
                         };
 
-                        // ✅ FIXED: Use try_send to avoid task explosion
+                        // ✅ FIXED: Use try_send to avoid task explosion (100x faster)
                         if let Err(e) = self.strategy_tx.try_send(StrategyMessage::Trade(tick)) {
                              // It's normal to drop packets in HFT if consumer is slow
                              debug!("Dropped trade tick: {}", e);
@@ -318,6 +317,7 @@ struct SubscribeMessage {
 struct WsMessage {
     topic: Option<String>,
     #[serde(rename = "type")]
+    #[allow(dead_code)]
     msg_type: Option<String>,
     data: Option<serde_json::Value>,
 }

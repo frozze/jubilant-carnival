@@ -4,12 +4,19 @@ use crate::exchange::SymbolSpecs;
 use crate::models::*;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
-use std::time::Instant;
 use tracing::{debug, info, warn};
+
+/// ✅ FIXED: Proper state machine for order lifecycle
+#[derive(Debug, Clone, PartialEq)]
+enum StrategyState {
+    Idle,                 // No position, no order
+    OrderPending,         // Order sent, waiting for confirmation
+    PositionOpen,         // Position confirmed by exchange
+    ClosingPosition,      // Close order sent, waiting for confirmation
+}
 
 /// StrategyEngine - Impulse/Momentum Scalping with Smart Order Routing
 pub struct StrategyEngine {
@@ -29,9 +36,8 @@ pub struct StrategyEngine {
     // Entry conditions
     momentum_threshold: f64,
 
-    // ✅ CRITICAL: Prevent order spam
-    order_in_progress: bool,
-    last_order_time: Option<Instant>,
+    // ✅ FIXED: Proper state machine replaces simple boolean
+    state: StrategyState,
 }
 
 impl StrategyEngine {
@@ -50,18 +56,19 @@ impl StrategyEngine {
             current_specs: None,
             tick_buffer: RingBuffer::new(100),
             momentum_threshold: 0.001, // 0.1% momentum threshold
-            order_in_progress: false,
-            last_order_time: None,
+            state: StrategyState::Idle,
         }
     }
 
     pub async fn run(mut self) {
         info!("⚡ StrategyEngine started");
 
-        let mut tick_interval = interval(Duration::from_secs(1));
+        // ✅ FIXED: Add periodic position verification (every 60 seconds)
+        let mut position_verify_interval = interval(Duration::from_secs(60));
 
         loop {
             tokio::select! {
+                // Handle incoming messages
                 Some(msg) = self.message_rx.recv() => {
                     match msg {
                         StrategyMessage::OrderBook(snapshot) => {
@@ -71,71 +78,114 @@ impl StrategyEngine {
                             self.handle_trade(tick).await;
                         }
                         StrategyMessage::PositionUpdate(position) => {
-                            self.current_position = position;
+                            self.current_position = position.clone();
+                            // ✅ FIXED: Update state machine based on position
+                            if position.is_some() {
+                                info!("📍 Position confirmed, transitioning to PositionOpen");
+                                self.state = StrategyState::PositionOpen;
+                            } else if self.state == StrategyState::ClosingPosition {
+                                info!("✅ Position closed, transitioning to Idle");
+                                self.state = StrategyState::Idle;
+                            }
                         }
                         StrategyMessage::SymbolChanged { symbol: new_symbol, specs } => {
                             self.handle_symbol_change(new_symbol, specs).await;
                         }
-                        // ✅ CRITICAL: Feedback from execution
+                        // ✅ CRITICAL: Feedback from execution with state transitions
                         StrategyMessage::OrderFilled(symbol) => {
-                            info!("✅ Order filled for {}, unfreezing strategy", symbol);
-                            self.order_in_progress = false;
-                            self.last_order_time = None;
+                            info!("✅ Order filled for {}, transitioning state", symbol);
+                            match self.state {
+                                StrategyState::OrderPending => {
+                                    // Entry order filled - wait for PositionUpdate
+                                    debug!("Entry order filled, waiting for PositionUpdate");
+                                }
+                                StrategyState::ClosingPosition => {
+                                    // Close order filled
+                                    info!("Close order filled, transitioning to Idle");
+                                    self.state = StrategyState::Idle;
+                                    self.current_position = None;
+                                }
+                                _ => {
+                                    warn!("Received OrderFilled in unexpected state: {:?}", self.state);
+                                }
+                            }
                         }
                         StrategyMessage::OrderFailed(error) => {
-                            warn!("❌ Order failed: {}, unfreezing strategy", error);
-                            self.order_in_progress = false;
-                            self.last_order_time = None;
-                            // Also clear position expectation
+                            warn!("❌ Order failed: {}, transitioning to Idle", error);
+                            self.state = StrategyState::Idle;
                             self.current_position = None;
                         }
                     }
                 }
-                _ = tick_interval.tick() => {
-                    // ✅ FIXED: Check for order timeout (Freeze Protection)
-                    if self.order_in_progress {
-                        if let Some(last_time) = self.last_order_time {
-                            if last_time.elapsed() > Duration::from_secs(10) {
-                                warn!("⚠️  Order execution TIMEOUT after 10s - forcing unfreeze");
-                                self.order_in_progress = false;
-                                self.last_order_time = None;
-                            }
+
+                // ✅ FIXED: Periodic position verification (prevents desync)
+                _ = position_verify_interval.tick() => {
+                    if let Some(ref symbol) = self.current_symbol {
+                        debug!("🔍 Verifying position for {}", symbol);
+                        if let Err(e) = self
+                            .execution_tx
+                            .send(ExecutionMessage::GetPosition(symbol.clone()))
+                            .await
+                        {
+                            warn!("Failed to request position verification: {}", e);
                         }
                     }
                 }
-                else => break,
+
+                // Channel closed
+                else => {
+                    info!("StrategyEngine message channel closed, shutting down");
+                    break;
+                }
             }
         }
     }
 
     async fn handle_symbol_change(&mut self, new_symbol: Symbol, specs: SymbolSpecs) {
-        info!("🔄 Symbol changed to: {} (qty_step={}, tick_size={})", 
+        info!("🔄 Symbol changed to: {} (qty_step: {}, tick_size: {})",
               new_symbol, specs.qty_step, specs.tick_size);
 
         // Close any existing position
         if let Some(ref position) = self.current_position {
             info!("⚠️  Closing position on {} before symbol switch", position.symbol);
 
-            let _ = self
+            // ✅ FIXED: Transition to ClosingPosition state
+            self.state = StrategyState::ClosingPosition;
+
+            if let Err(e) = self
                 .execution_tx
                 .send(ExecutionMessage::ClosePosition {
                     symbol: position.symbol.clone(),
                     position_side: position.side,
                 })
-                .await;
+                .await
+            {
+                warn!("Failed to send ClosePosition on symbol change: {}", e);
+                // Will reset to Idle below anyway
+            }
         }
 
         // Reset state
         self.current_symbol = Some(new_symbol);
-        self.current_specs = Some(specs);
         self.current_position = None;
         self.last_orderbook = None;
+        self.current_specs = Some(specs);
         self.tick_buffer = RingBuffer::new(100);
-        self.order_in_progress = false; // ✅ Reset order lock
-        self.last_order_time = None;
+        self.state = StrategyState::Idle; // ✅ Reset state machine
     }
 
     async fn handle_orderbook(&mut self, snapshot: OrderBookSnapshot) {
+        // ✅ FIXED: Prevent race condition - ignore messages from old symbol
+        if let Some(ref current_symbol) = self.current_symbol {
+            if snapshot.symbol != *current_symbol {
+                debug!(
+                    "Ignoring orderbook from old symbol {} (current: {})",
+                    snapshot.symbol, current_symbol
+                );
+                return;
+            }
+        }
+
         // Update current price if we have a position
         if let Some(ref mut position) = self.current_position {
             position.current_price = snapshot.mid_price;
@@ -149,13 +199,20 @@ impl StrategyEngine {
                     position.pnl_percent()
                 );
 
-                let _ = self
+                // ✅ FIXED: Transition to ClosingPosition state
+                self.state = StrategyState::ClosingPosition;
+
+                if let Err(e) = self
                     .execution_tx
                     .send(ExecutionMessage::ClosePosition {
                         symbol: position.symbol.clone(),
                         position_side: position.side,
                     })
-                    .await;
+                    .await
+                {
+                    warn!("Failed to send ClosePosition for stop loss: {}", e);
+                    self.state = StrategyState::PositionOpen; // Revert state on failure
+                }
 
                 return;
             }
@@ -168,13 +225,20 @@ impl StrategyEngine {
                     position.symbol, pnl_pct
                 );
 
-                let _ = self
+                // ✅ FIXED: Transition to ClosingPosition state
+                self.state = StrategyState::ClosingPosition;
+
+                if let Err(e) = self
                     .execution_tx
                     .send(ExecutionMessage::ClosePosition {
                         symbol: position.symbol.clone(),
                         position_side: position.side,
                     })
-                    .await;
+                    .await
+                {
+                    warn!("Failed to send ClosePosition for take profit: {}", e);
+                    self.state = StrategyState::PositionOpen; // Revert state on failure
+                }
 
                 return;
             }
@@ -184,6 +248,17 @@ impl StrategyEngine {
     }
 
     async fn handle_trade(&mut self, tick: TradeTick) {
+        // ✅ FIXED: Prevent race condition - ignore messages from old symbol
+        if let Some(ref current_symbol) = self.current_symbol {
+            if tick.symbol != *current_symbol {
+                debug!(
+                    "Ignoring trade tick from old symbol {} (current: {})",
+                    tick.symbol, current_symbol
+                );
+                return;
+            }
+        }
+
         // Add to buffer
         self.tick_buffer.push(tick.clone());
 
@@ -192,14 +267,9 @@ impl StrategyEngine {
             return;
         }
 
-        // ✅ CRITICAL: Skip if order already in progress
-        if self.order_in_progress {
-            debug!("⏸️  Order in progress, skipping new entry signals");
-            return;
-        }
-
-        // Skip if we already have a position
-        if self.current_position.is_some() {
+        // ✅ FIXED: State machine prevents double entry, entry while closing, etc.
+        if self.state != StrategyState::Idle {
+            debug!("⏸️  Not in Idle state ({:?}), skipping new entry signals", self.state);
             return;
         }
 
@@ -271,17 +341,24 @@ impl StrategyEngine {
         );
 
         // Determine side
-        let (side, position_side) = if momentum > 0.0 {
-            (OrderSide::Buy, PositionSide::Long)
+        let side = if momentum > 0.0 {
+            OrderSide::Buy
         } else {
-            (OrderSide::Sell, PositionSide::Short)
+            OrderSide::Sell
         };
 
         // Calculate position size
         let position_value = Decimal::from_str_exact(&self.config.max_position_size_usd.to_string())
             .unwrap_or(Decimal::from(1000));
 
-        let qty = position_value / orderbook.mid_price;
+        let mut qty = position_value / orderbook.mid_price;
+
+        // ✅ Round qty using symbol specs
+        if let Some(ref specs) = self.current_specs {
+            qty = specs.clamp_qty(qty);
+            debug!("Rounded qty from {} to {} (step: {})",
+                   position_value / orderbook.mid_price, qty, specs.qty_step);
+        }
 
         // Smart Order Routing based on liquidity
         let (order_type, price, time_in_force) = if orderbook.is_liquid() {
@@ -291,10 +368,17 @@ impl StrategyEngine {
         } else {
             // Wide spread: Try to capture maker rebate with PostOnly limit
             info!("📊 Using PostOnly Limit Order (wide spread)");
-            let limit_price = match side {
+            let mut limit_price = match side {
                 OrderSide::Buy => orderbook.best_bid, // Join the bid
                 OrderSide::Sell => orderbook.best_ask, // Join the ask
             };
+
+            // ✅ Round price using symbol specs
+            if let Some(ref specs) = self.current_specs {
+                limit_price = specs.round_price(limit_price);
+                debug!("Rounded price to {} (tick_size: {})", limit_price, specs.tick_size);
+            }
+
             (OrderType::Limit, Some(limit_price), TimeInForce::PostOnly)
         };
 
@@ -306,21 +390,23 @@ impl StrategyEngine {
             price,
             time_in_force,
             reduce_only: false,
-            qty_step: self.current_specs.as_ref().map(|s| s.qty_step),
-            tick_size: self.current_specs.as_ref().map(|s| s.tick_size),
         };
 
         // ✅ FIXED: Don't set position optimistically - wait for exchange confirmation
         // Position will be set via PositionUpdate message from ExecutionActor
 
-        // ✅ CRITICAL: Lock strategy to prevent order spam
-        self.order_in_progress = true;
-        self.last_order_time = Some(Instant::now());
+        // ✅ FIXED: Transition to OrderPending state
+        self.state = StrategyState::OrderPending;
 
         // Send order to execution
-        let _ = self
+        if let Err(e) = self
             .execution_tx
             .send(ExecutionMessage::PlaceOrder(order))
-            .await;
+            .await
+        {
+            warn!("Failed to send PlaceOrder to execution: {}", e);
+            // Revert state if send failed
+            self.state = StrategyState::Idle;
+        }
     }
 }

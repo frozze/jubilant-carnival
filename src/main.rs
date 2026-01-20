@@ -41,7 +41,8 @@ async fn main() -> Result<()> {
 
     // Actor Communication Channels
     // Scanner -> MarketData
-    let (market_data_cmd_tx, market_data_cmd_rx) = mpsc::channel(32);
+    // ✅ FIXED: Increased from 32 to 256 to prevent deadlock
+    let (market_data_cmd_tx, market_data_cmd_rx) = mpsc::channel(256);
 
     // MarketData -> Strategy
     let (strategy_tx, strategy_rx) = mpsc::channel(1000);

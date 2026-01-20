@@ -321,6 +321,54 @@ impl BybitClient {
         }
     }
 
+    /// GET /v5/order/realtime
+    /// Query order status by order ID
+    /// Returns order details including status: "New", "PartiallyFilled", "Filled", "Cancelled", "Rejected"
+    pub async fn get_order_status(&self, symbol: &str, order_id: &str) -> Result<OrderStatusResponse> {
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let url = format!("{}/v5/order/realtime", self.base_url);
+
+        // Build query string for signature (GET request)
+        let query_string = format!("category=linear&symbol={}&orderId={}", symbol, order_id);
+
+        // Sign the query string
+        let signature = self.sign(timestamp, RECV_WINDOW, &query_string);
+
+        debug!("Querying order status for {}", order_id);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("X-BAPI-API-KEY", &self.api_key)
+            .header("X-BAPI-TIMESTAMP", timestamp.to_string())
+            .header("X-BAPI-SIGN", &signature)
+            .header("X-BAPI-RECV-WINDOW", RECV_WINDOW)
+            .query(&[
+                ("category", "linear"),
+                ("symbol", symbol),
+                ("orderId", order_id),
+            ])
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            let data: ApiResponse<OrderStatusListResponse> = response
+                .json()
+                .await
+                .context("Failed to parse order status response")?;
+
+            if data.ret_code == 0 && !data.result.list.is_empty() {
+                Ok(data.result.list[0].clone())
+            } else {
+                anyhow::bail!("Order not found or API error: {} - {}", data.ret_code, data.ret_msg);
+            }
+        } else {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Get order status failed: {} - {}", status, body);
+        }
+    }
+
     /// Cancel all orders for a symbol (useful for emergency stops)
     #[allow(dead_code)]
     pub async fn cancel_all_orders(&self, symbol: &str) -> Result<()> {
@@ -409,6 +457,7 @@ pub struct PositionInfo {
     pub unrealised_pnl: String,
 }
 
+// ✅ Symbol specification types (for dynamic precision)
 #[derive(Debug, Deserialize)]
 pub struct InstrumentsResponse {
     pub list: Vec<InstrumentInfo>,
@@ -434,6 +483,28 @@ pub struct LotSizeFilter {
 #[serde(rename_all = "camelCase")]
 pub struct PriceFilter {
     pub tick_size: String,
+}
+
+// ✅ Order status types (for order confirmation polling)
+#[derive(Debug, Deserialize)]
+pub struct OrderStatusListResponse {
+    pub list: Vec<OrderStatusResponse>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderStatusResponse {
+    pub order_id: String,
+    pub order_link_id: String,
+    pub symbol: String,
+    pub order_status: String, // "New", "PartiallyFilled", "Filled", "Cancelled", "Rejected"
+    pub order_type: String,
+    pub side: String,
+    pub price: String,
+    pub qty: String,
+    pub cum_exec_qty: String, // Cumulative executed quantity
+    pub cum_exec_value: String,
+    pub avg_price: String, // Average fill price
 }
 
 #[cfg(test)]

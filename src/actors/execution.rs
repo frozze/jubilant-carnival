@@ -11,6 +11,7 @@ use tracing::{error, info, warn};
 /// ExecutionActor - Order placement and position tracking
 pub struct ExecutionActor {
     client: BybitClient,
+    #[allow(dead_code)]
     config: Arc<Config>,
     message_rx: mpsc::Receiver<ExecutionMessage>,
     strategy_tx: mpsc::Sender<StrategyMessage>,
@@ -55,32 +56,109 @@ impl ExecutionActor {
 
     async fn handle_place_order(&self, order: Order) {
         let symbol = order.symbol.clone();
+        let symbol_str = symbol.0.clone();
 
         info!(
             "📤 Placing order: {:?} {} {} @ {:?}",
             order.side, order.qty, symbol, order.price
         );
 
-        match self.client.place_order(&order).await {
+        // Step 1: Place order
+        let order_id = match self.client.place_order(&order).await {
             Ok(response) => {
-                info!("✅ Order placed successfully: {}", response.order_id);
-
-                // ✅ CRITICAL: Notify strategy that order is filled
-                let _ = self
-                    .strategy_tx
-                    .send(StrategyMessage::OrderFilled(symbol))
-                    .await;
+                info!("✅ Order accepted by exchange: {}", response.order_id);
+                response.order_id
             }
             Err(e) => {
                 let error_msg = format!("Failed to place order: {}", e);
                 error!("❌ {}", error_msg);
 
-                // ✅ CRITICAL: Notify strategy that order failed
-                let _ = self
+                // Notify strategy that order failed
+                if let Err(e) = self
                     .strategy_tx
                     .send(StrategyMessage::OrderFailed(error_msg))
-                    .await;
+                    .await
+                {
+                    error!("Failed to send OrderFailed message: {}", e);
+                }
+                return;
             }
+        };
+
+        // ✅ FIXED: Step 2 - Poll for order confirmation (up to 10 seconds)
+        let max_polls = 20; // 20 polls × 500ms = 10 seconds
+        let poll_interval = tokio::time::Duration::from_millis(500);
+
+        for attempt in 1..=max_polls {
+            tokio::time::sleep(poll_interval).await;
+
+            match self.client.get_order_status(&symbol_str, &order_id).await {
+                Ok(order_status) => {
+                    info!(
+                        "📊 Order {} status: {} (attempt {}/{})",
+                        order_id, order_status.order_status, attempt, max_polls
+                    );
+
+                    match order_status.order_status.as_str() {
+                        "Filled" => {
+                            info!("✅ Order {} FILLED", order_id);
+
+                            // Notify strategy
+                            if let Err(e) = self
+                                .strategy_tx
+                                .send(StrategyMessage::OrderFilled(symbol.clone()))
+                                .await
+                            {
+                                error!("Failed to send OrderFilled message: {}", e);
+                            }
+
+                            // Query position and send update
+                            self.handle_get_position(symbol).await;
+                            return;
+                        }
+                        "Cancelled" | "Rejected" => {
+                            let error_msg = format!("Order {} {}", order_id, order_status.order_status);
+                            error!("❌ {}", error_msg);
+
+                            if let Err(e) = self
+                                .strategy_tx
+                                .send(StrategyMessage::OrderFailed(error_msg))
+                                .await
+                            {
+                                error!("Failed to send OrderFailed message: {}", e);
+                            }
+                            return;
+                        }
+                        "PartiallyFilled" | "New" => {
+                            // Continue polling
+                            continue;
+                        }
+                        _ => {
+                            warn!("Unknown order status: {}", order_status.order_status);
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to query order status (attempt {}/{}): {}",
+                        attempt, max_polls, e
+                    );
+                    continue;
+                }
+            }
+        }
+
+        // Timeout - order not filled within 10 seconds
+        let error_msg = format!("Order {} confirmation timeout after 10 seconds", order_id);
+        error!("⏰ {}", error_msg);
+
+        if let Err(e) = self
+            .strategy_tx
+            .send(StrategyMessage::OrderFailed(error_msg))
+            .await
+        {
+            error!("Failed to send OrderFailed message: {}", e);
         }
     }
 
@@ -132,10 +210,13 @@ impl ExecutionActor {
                             info!("✅ Position closed: {}", response.order_id);
 
                             // Notify strategy
-                            let _ = self
+                            if let Err(e) = self
                                 .strategy_tx
                                 .send(StrategyMessage::PositionUpdate(None))
-                                .await;
+                                .await
+                            {
+                                error!("Failed to send PositionUpdate(None) after close: {}", e);
+                            }
                         }
                         Err(e) => {
                             error!("❌ Failed to close position: {}", e);
@@ -153,10 +234,13 @@ impl ExecutionActor {
         match self.client.get_position(&symbol.0).await {
             Ok(positions) => {
                 if positions.is_empty() {
-                    let _ = self
+                    if let Err(e) = self
                         .strategy_tx
                         .send(StrategyMessage::PositionUpdate(None))
-                        .await;
+                        .await
+                    {
+                        error!("Failed to send PositionUpdate(None): {}", e);
+                    }
                     return;
                 }
 
@@ -181,19 +265,25 @@ impl ExecutionActor {
                             stop_loss: None,
                         };
 
-                        let _ = self
+                        if let Err(e) = self
                             .strategy_tx
                             .send(StrategyMessage::PositionUpdate(Some(position)))
-                            .await;
+                            .await
+                        {
+                            error!("Failed to send PositionUpdate(Some): {}", e);
+                        }
 
                         return;
                     }
                 }
 
-                let _ = self
+                if let Err(e) = self
                     .strategy_tx
                     .send(StrategyMessage::PositionUpdate(None))
-                    .await;
+                    .await
+                {
+                    error!("Failed to send PositionUpdate(None) after loop: {}", e);
+                }
             }
             Err(e) => {
                 error!("Failed to get position: {}", e);

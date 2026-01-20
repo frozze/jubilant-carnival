@@ -8,6 +8,10 @@ pub struct Config {
     pub bybit_api_secret: String,
     pub testnet: bool,
 
+    // ✅ NEW: Custom URLs for Demo Trading / Custom Endpoints
+    pub custom_rest_url: Option<String>,
+    pub custom_ws_url: Option<String>,
+
     // Trading parameters
     pub max_position_size_usd: f64,
     pub stop_loss_percent: f64,
@@ -36,6 +40,10 @@ impl Config {
                 .unwrap_or_else(|_| "false".to_string())
                 .parse()
                 .unwrap_or(false),
+
+            // ✅ NEW: Load custom URLs if provided
+            custom_rest_url: env::var("BYBIT_REST_URL").ok(),
+            custom_ws_url: env::var("BYBIT_WS_URL").ok(),
 
             max_position_size_usd: env::var("MAX_POSITION_SIZE_USD")
                 .unwrap_or_else(|_| "1000.0".to_string())
@@ -74,19 +82,33 @@ impl Config {
         })
     }
 
-    pub fn rest_api_url(&self) -> &str {
-        if self.testnet {
-            "https://api-testnet.bybit.com"
+    /// Get REST API URL
+    /// Priority: 1. Custom URL (BYBIT_REST_URL)
+    ///           2. Testnet URL
+    ///           3. Mainnet URL (default)
+    pub fn rest_api_url(&self) -> String {
+        if let Some(ref custom_url) = self.custom_rest_url {
+            // Custom URL takes highest priority (for Demo Trading)
+            custom_url.clone()
+        } else if self.testnet {
+            "https://api-testnet.bybit.com".to_string()
         } else {
-            "https://api.bybit.com"
+            "https://api.bybit.com".to_string()
         }
     }
 
-    pub fn ws_url(&self) -> &str {
-        if self.testnet {
-            "wss://stream-testnet.bybit.com/v5/public/linear"
+    /// Get WebSocket URL
+    /// Priority: 1. Custom URL (BYBIT_WS_URL)
+    ///           2. Testnet URL
+    ///           3. Mainnet URL (default)
+    pub fn ws_url(&self) -> String {
+        if let Some(ref custom_url) = self.custom_ws_url {
+            // Custom URL takes highest priority (for Demo Trading)
+            custom_url.clone()
+        } else if self.testnet {
+            "wss://stream-testnet.bybit.com/v5/public/linear".to_string()
         } else {
-            "wss://stream.bybit.com/v5/public/linear"
+            "wss://stream.bybit.com/v5/public/linear".to_string()
         }
     }
 }

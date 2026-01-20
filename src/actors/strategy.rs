@@ -23,6 +23,9 @@ pub struct StrategyEngine {
 
     // Entry conditions
     momentum_threshold: f64,
+
+    // ✅ CRITICAL: Prevent order spam
+    order_in_progress: bool,
 }
 
 impl StrategyEngine {
@@ -40,6 +43,7 @@ impl StrategyEngine {
             last_orderbook: None,
             tick_buffer: RingBuffer::new(100),
             momentum_threshold: 0.001, // 0.1% momentum threshold
+            order_in_progress: false,
         }
     }
 
@@ -59,6 +63,17 @@ impl StrategyEngine {
                 }
                 StrategyMessage::SymbolChanged(new_symbol) => {
                     self.handle_symbol_change(new_symbol).await;
+                }
+                // ✅ CRITICAL: Feedback from execution
+                StrategyMessage::OrderFilled(symbol) => {
+                    info!("✅ Order filled for {}, unfreezing strategy", symbol);
+                    self.order_in_progress = false;
+                }
+                StrategyMessage::OrderFailed(error) => {
+                    warn!("❌ Order failed: {}, unfreezing strategy", error);
+                    self.order_in_progress = false;
+                    // Also clear position expectation
+                    self.current_position = None;
                 }
             }
         }
@@ -85,6 +100,7 @@ impl StrategyEngine {
         self.current_position = None;
         self.last_orderbook = None;
         self.tick_buffer = RingBuffer::new(100);
+        self.order_in_progress = false; // ✅ Reset order lock
     }
 
     async fn handle_orderbook(&mut self, snapshot: OrderBookSnapshot) {
@@ -141,6 +157,12 @@ impl StrategyEngine {
 
         // Only trade if we have enough data
         if self.tick_buffer.len() < 20 {
+            return;
+        }
+
+        // ✅ CRITICAL: Skip if order already in progress
+        if self.order_in_progress {
+            debug!("⏸️  Order in progress, skipping new entry signals");
             return;
         }
 
@@ -275,6 +297,9 @@ impl StrategyEngine {
         };
 
         self.current_position = Some(position);
+
+        // ✅ CRITICAL: Lock strategy to prevent order spam
+        self.order_in_progress = true;
 
         // Send order to execution
         let _ = self

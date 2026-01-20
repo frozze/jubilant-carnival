@@ -45,9 +45,6 @@ pub struct OrderBookSnapshot {
     pub ask_size: Decimal,
     pub mid_price: Decimal,
     pub spread_bps: f64, // basis points
-    // Instrument precision for order rounding
-    pub qty_step: Option<Decimal>,
-    pub tick_size: Option<Decimal>,
 }
 
 impl OrderBookSnapshot {
@@ -79,16 +76,7 @@ impl OrderBookSnapshot {
             ask_size,
             mid_price,
             spread_bps,
-            qty_step: None,
-            tick_size: None,
         }
-    }
-    
-    /// Set instrument precision (call after fetching from API)
-    pub fn with_precision(mut self, qty_step: Option<Decimal>, tick_size: Option<Decimal>) -> Self {
-        self.qty_step = qty_step;
-        self.tick_size = tick_size;
-        self
     }
 
     /// Check if orderbook is liquid enough for market orders

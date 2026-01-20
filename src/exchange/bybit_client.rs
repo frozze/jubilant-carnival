@@ -111,19 +111,23 @@ impl BybitClient {
         let timestamp = chrono::Utc::now().timestamp_millis();
         let url = format!("{}/v5/order/create", self.base_url);
 
+        // Round qty to 2 decimal places (standard for most perpetual pairs)
+        let qty_rounded = order.qty.round_dp(2);
+        
         // Build JSON payload
         let mut payload = json!({
             "category": "linear",
             "symbol": order.symbol.0,
             "side": format!("{:?}", order.side),
             "orderType": format!("{:?}", order.order_type),
-            "qty": order.qty.to_string(),
+            "qty": qty_rounded.to_string(),
             "timeInForce": format!("{:?}", order.time_in_force),
         });
 
-        // Add optional fields
+        // Add optional fields - round price to 4 decimals
         if let Some(price) = order.price {
-            payload["price"] = json!(price.to_string());
+            let price_rounded = price.round_dp(4);
+            payload["price"] = json!(price_rounded.to_string());
         }
 
         if order.reduce_only {

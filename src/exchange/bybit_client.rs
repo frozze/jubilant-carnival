@@ -161,10 +161,11 @@ impl BybitClient {
 
             match response {
                 Ok(resp) if resp.status().is_success() => {
-                    let data: ApiResponse<PlaceOrderResponse> = resp
-                        .json()
-                        .await
-                        .context("Failed to parse order response")?;
+                    let raw_body = resp.text().await.context("Failed to read response body")?;
+                    debug!("Raw order response: {}", raw_body);
+                    
+                    let data: ApiResponse<PlaceOrderResponse> = serde_json::from_str(&raw_body)
+                        .context(format!("Failed to parse order response: {}", raw_body))?;
 
                     if data.ret_code == 0 {
                         debug!("Order placed successfully: {}", data.result.order_id);

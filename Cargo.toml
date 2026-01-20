@@ -1,0 +1,61 @@
+[package]
+name = "bybit-scalper-bot"
+version = "0.1.0"
+edition = "2021"
+authors = ["HFT Trading Team"]
+
+[dependencies]
+# Async Runtime
+tokio = { version = "1.42", features = ["full", "tracing"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+
+# HTTP Client
+reqwest = { version = "0.12", features = ["json", "native-tls"] }
+
+# Serialization (high-performance)
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+simd-json = { version = "0.13", optional = true }
+
+# Error Handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Configuration & Environment
+dotenvy = "0.15"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Cryptography (for Bybit signatures)
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Data Structures
+dashmap = "6.1"
+parking_lot = "0.12"
+
+# Numeric types
+rust_decimal = { version = "1.36", features = ["serde-with-str"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.release-with-debug]
+inherits = "release"
+strip = false
+debug = true
+
+[features]
+default = []
+simd = ["simd-json"]

@@ -232,11 +232,11 @@ impl MarketDataActor {
                             Decimal::from_str(ask_size).unwrap_or(Decimal::ZERO),
                         );
 
-                        // Send to strategy (non-blocking)
-                        let tx = self.strategy_tx.clone();
-                        tokio::spawn(async move {
-                            let _ = tx.send(StrategyMessage::OrderBook(snapshot)).await;
-                        });
+                        // ✅ FIXED: Use try_send to avoid task explosion
+                        if let Err(e) = self.strategy_tx.try_send(StrategyMessage::OrderBook(snapshot)) {
+                             // It's normal to drop packets in HFT if consumer is slow
+                             debug!("Dropped orderbook snapshot: {}", e);
+                        }
                     }
                 }
             }
@@ -294,11 +294,11 @@ impl MarketDataActor {
                             side,
                         };
 
-                        // Send to strategy (non-blocking)
-                        let tx = self.strategy_tx.clone();
-                        tokio::spawn(async move {
-                            let _ = tx.send(StrategyMessage::Trade(tick)).await;
-                        });
+                        // ✅ FIXED: Use try_send to avoid task explosion
+                        if let Err(e) = self.strategy_tx.try_send(StrategyMessage::Trade(tick)) {
+                             // It's normal to drop packets in HFT if consumer is slow
+                             debug!("Dropped trade tick: {}", e);
+                        }
                     }
                 }
             }

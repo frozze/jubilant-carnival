@@ -1,12 +1,8 @@
 # 🎯 Bybit Dynamic Scalper Bot
 
-Production-ready HFT scalping bot for Bybit (Unified Trading Account) with dynamic asset switching.
+Production-ready HFT scalping bot for Bybit Linear Perpetuals with dynamic asset switching.
 
 ## 🏗️ Architecture
-
-### Actor Model Design
-
-The bot uses a concurrent actor architecture with `tokio::sync::mpsc` channels:
 
 ```
 ┌─────────────────┐
@@ -34,206 +30,119 @@ The bot uses a concurrent actor architecture with `tokio::sync::mpsc` channels:
 
 ## 🔑 Key Features
 
-### 1. **The "Predator" Scanner**
-- Scans top-50 coins every 60 seconds
-- Scoring formula: `Turnover24h * |PriceChange24h|`
-- Whitelisted coins (SUI, WIF, VIRTUAL, RENDER, SEI, PEPE) receive 30% score boost
-- Automatically switches to new leader if score exceeds `current * 1.2`
+### 1. **Dynamic Asset Scanner**
+- Scans all USDT perpetual pairs every 60 seconds
+- Pure scoring formula: `Turnover24h × |PriceChange24h|`
+- Auto-switches to new leader if score exceeds `current × 1.2`
+- Excludes stablecoins (USDC, BUSD, DAI, TUSD) and low-volatility pairs (BTC, ETH)
 
 ### 2. **Hot-Swap WebSocket**
-- Maintains persistent connection
-- Seamless symbol switching: `unsubscribe old → subscribe new`
-- No connection drops during asset changes
-- Zero-copy JSON parsing with `serde_json`
+- Seamless symbol switching without connection drops
+- Stale data filtering (>500ms ignored)
+- Backpressure-aware tick delivery
 
 ### 3. **Liquidity-Aware Execution**
+- **Liquid markets**: IOC Market Orders for instant execution
+- **Wide spreads**: PostOnly Limit Orders at best bid/ask (captures maker rebates)
 
-**For liquid markets (narrow spread):**
-- IOC Market Orders for instant execution
-
-**For wide spreads:**
-- PostOnly Limit Orders at best bid/ask
-- Captures maker rebates
-- Order chasing if price moves away
-
-### 4. **Risk Management**
-- In-memory stop loss (0.5% default)
-- Take profit at 1.0% (configurable)
-- Automatic position closure before symbol switch
-- Stale data filtering (>500ms ignored)
-
-## 📂 Project Structure
-
-```
-bybit-scalper-bot/
-├── src/
-│   ├── main.rs                 # Actor initialization & startup
-│   ├── lib.rs                  # Module exports
-│   ├── config.rs               # Configuration from .env
-│   ├── actors/
-│   │   ├── mod.rs
-│   │   ├── messages.rs         # Inter-actor communication types
-│   │   ├── scanner.rs          # Volatility scanner
-│   │   ├── websocket.rs        # Market data feed (hot-swap)
-│   │   ├── strategy.rs         # Trading logic
-│   │   └── execution.rs        # Order placement
-│   ├── exchange/
-│   │   ├── mod.rs
-│   │   └── bybit_client.rs     # REST API client with retry logic
-│   └── models/
-│       ├── mod.rs
-│       └── types.rs            # Core data structures (RingBuffer, Order, Position)
-├── Cargo.toml                  # Dependencies + Release optimizations
-├── .env.example
-└── README.md
-```
+### 4. **Safety Features**
+- **Order Timeout**: 10s automatic unfreeze if execution hangs
+- **Live Score Tracking**: Detects when current asset "dies" and forces switch
+- **Stop Loss/Take Profit**: Configurable risk management
 
 ## 🚀 Quick Start
 
-### 1. Install Rust
+### Local Development
 
 ```bash
+# Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
 
-### 2. Clone & Configure
-
-```bash
+# Clone and configure
 git clone <your-repo>
 cd bybit-scalper-bot
-
-# Copy and edit environment variables
 cp .env.example .env
 nano .env  # Add your Bybit API keys
-```
 
-### 3. Build & Run
-
-**Development mode:**
-```bash
+# Run
 cargo run
 ```
 
-**Production mode (optimized):**
+### Docker Deployment
+
 ```bash
-cargo build --release
-./target/release/bybit-scalper-bot
+# Build and run
+docker compose up -d
+
+# View logs
+docker logs -f bybit-scalper
+
+# Stop
+docker compose down
 ```
 
-## ⚙️ Configuration
+### CI/CD Deployment
 
-Edit `.env` file:
+1. Add secrets to GitHub repository:
+   - `SERVER_HOST` - Your server IP
+   - `SERVER_USER` - SSH username
+   - `SERVER_SSH_KEY` - Private SSH key
+   - `DEPLOY_PATH` - Path to docker-compose.yml on server
+
+2. Push to `main` branch - automatic build & deploy
+
+## ⚙️ Configuration
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `BYBIT_API_KEY` | Your API key | - |
 | `BYBIT_API_SECRET` | Your API secret | - |
-| `BYBIT_TESTNET` | Use testnet | `true` |
 | `MAX_POSITION_SIZE_USD` | Position size in USD | `1000.0` |
 | `STOP_LOSS_PERCENT` | Stop loss % | `0.5` |
 | `TAKE_PROFIT_PERCENT` | Take profit % | `1.0` |
 | `SCAN_INTERVAL_SECS` | Scanner frequency | `60` |
 | `MIN_TURNOVER_24H_USD` | Min 24h volume filter | `10000000` |
-| `SCORE_THRESHOLD_MULTIPLIER` | Switch threshold | `1.2` |
 | `MAX_SPREAD_BPS` | Max allowed spread (bps) | `20.0` |
-| `STALE_DATA_THRESHOLD_MS` | Max data age (ms) | `500` |
 
-## 📊 Performance Optimizations
+## 📊 Strategy Details
 
-### Cargo.toml Release Profile
+### Entry Conditions
+1. **Momentum**: VWAP deviation of last 50 ticks > 0.1%
+2. **Spread**: Below configured max spread
+3. **No existing position**
 
-```toml
-[profile.release]
-opt-level = 3          # Maximum optimization
-lto = "fat"            # Link-time optimization
-codegen-units = 1      # Single codegen unit for better optimization
-strip = true           # Strip symbols (smaller binary)
-panic = "abort"        # Abort on panic (no unwinding)
+### Exit Conditions
+1. **Stop Loss**: Default -0.5% from entry
+2. **Take Profit**: Default +1.0% from entry
+3. **Symbol switch**: Immediate market exit
+
+## 🔧 Project Structure
+
 ```
-
-### Zero-Copy Data Structures
-
-- **RingBuffer**: Fixed-size circular buffer (no allocations)
-- **Decimal arithmetic**: `rust_decimal` for precise financial calculations
-- **Message passing**: Lock-free `mpsc` channels
-
-## 🛡️ Error Handling
-
-- **API 502/504 errors**: Automatic retry with exponential backoff (2s, 4s, 8s)
-- **WebSocket disconnects**: Auto-reconnect with 5s delay
-- **No panics**: All errors handled via `anyhow::Result`
-
-## 🔍 Logging
-
-Uses `tracing` for structured logs:
-
-```bash
-# Set log level
-export RUST_LOG=debug
-cargo run
-
-# Available levels: trace, debug, info, warn, error
+src/
+├── main.rs              # Actor initialization
+├── config.rs            # Environment configuration
+├── actors/
+│   ├── scanner.rs       # Volatility scanner
+│   ├── websocket.rs     # Market data feed
+│   ├── strategy.rs      # Trading logic
+│   └── execution.rs     # Order placement
+├── exchange/
+│   └── bybit_client.rs  # REST API client
+└── models/
+    └── types.rs         # Core data structures
 ```
-
-## 🧪 Testing
-
-**Testnet mode** (recommended for testing):
-```bash
-# In .env
-BYBIT_TESTNET=true
-```
-
-**Get testnet API keys**: https://testnet.bybit.com
 
 ## ⚠️ Risk Disclaimer
 
-- **This bot is for educational purposes only**
-- Trading cryptocurrencies carries significant risk
+- **Educational purposes only**
 - Never trade with funds you cannot afford to lose
-- Always test thoroughly on testnet first
+- Always test on testnet first
 - Past performance does not guarantee future results
-
-## 📈 Strategy Details
-
-### Entry Conditions
-
-1. **Momentum calculation**: VWAP of last 20 ticks
-2. **Threshold**: Momentum > 0.1%
-3. **Spread check**: Must be < configured max spread
-4. **No existing position**
-
-### Exit Conditions
-
-1. **Stop Loss**: -0.5% from entry
-2. **Take Profit**: +1.0% from entry
-3. **Symbol switch**: Immediate market exit
-
-### Smart Order Routing
-
-```rust
-if orderbook.spread_bps < 10.0 && orderbook.is_liquid() {
-    // Use IOC Market Order
-} else {
-    // Use PostOnly Limit at best bid/ask
-}
-```
 
 ## 📝 License
 
-MIT License - See LICENSE file for details
-
-## 🤝 Contributing
-
-Contributions welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Add tests for new functionality
-4. Submit a pull request
-
-## 📧 Support
-
-For issues and questions, please open a GitHub issue.
+MIT License
 
 ---
 

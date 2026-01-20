@@ -121,9 +121,24 @@ impl ScannerActor {
                 top_coin.price_change_24h * 100.0
             );
 
+            // ✅ FIXED: Update current score from live candidates (Solve Zombie Bug)
+            let mut current_score_live = 0.0;
+            
+            if let Some(ref current) = self.current_symbol {
+                if let Some(current_candidate) = candidates.iter().find(|c| c.symbol == current.0) {
+                    current_score_live = current_candidate.score;
+                    // Update internal state to match reality
+                    self.current_score = current_score_live;
+                } else {
+                    // Current symbol dropped out of filter (volume crash?) -> Score 0 to force switch
+                    self.current_score = 0.0;
+                }
+            }
+
             // Check if we should switch
             let should_switch = if let Some(ref current) = self.current_symbol {
                 // Switch if new score is significantly higher (threshold multiplier)
+                // Compare against LIVE score, not stale score
                 top_coin.score > self.current_score * self.config.score_threshold_multiplier
                     && top_coin.symbol != current.0
             } else {

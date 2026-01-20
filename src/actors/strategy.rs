@@ -6,6 +6,8 @@ use rust_decimal::prelude::ToPrimitive;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::time::{interval, Duration};
+use std::time::Instant;
 use tracing::{debug, info, warn};
 
 /// StrategyEngine - Impulse/Momentum Scalping with Smart Order Routing
@@ -27,6 +29,7 @@ pub struct StrategyEngine {
 
     // ✅ CRITICAL: Prevent order spam
     order_in_progress: bool,
+    last_order_time: Option<Instant>,
 }
 
 impl StrategyEngine {
@@ -45,37 +48,59 @@ impl StrategyEngine {
             tick_buffer: RingBuffer::new(100),
             momentum_threshold: 0.001, // 0.1% momentum threshold
             order_in_progress: false,
+            last_order_time: None,
         }
     }
 
     pub async fn run(mut self) {
         info!("⚡ StrategyEngine started");
 
-        while let Some(msg) = self.message_rx.recv().await {
-            match msg {
-                StrategyMessage::OrderBook(snapshot) => {
-                    self.handle_orderbook(snapshot).await;
+        let mut tick_interval = interval(Duration::from_secs(1));
+
+        loop {
+            tokio::select! {
+                Some(msg) = self.message_rx.recv() => {
+                    match msg {
+                        StrategyMessage::OrderBook(snapshot) => {
+                            self.handle_orderbook(snapshot).await;
+                        }
+                        StrategyMessage::Trade(tick) => {
+                            self.handle_trade(tick).await;
+                        }
+                        StrategyMessage::PositionUpdate(position) => {
+                            self.current_position = position;
+                        }
+                        StrategyMessage::SymbolChanged(new_symbol) => {
+                            self.handle_symbol_change(new_symbol).await;
+                        }
+                        // ✅ CRITICAL: Feedback from execution
+                        StrategyMessage::OrderFilled(symbol) => {
+                            info!("✅ Order filled for {}, unfreezing strategy", symbol);
+                            self.order_in_progress = false;
+                            self.last_order_time = None;
+                        }
+                        StrategyMessage::OrderFailed(error) => {
+                            warn!("❌ Order failed: {}, unfreezing strategy", error);
+                            self.order_in_progress = false;
+                            self.last_order_time = None;
+                            // Also clear position expectation
+                            self.current_position = None;
+                        }
+                    }
                 }
-                StrategyMessage::Trade(tick) => {
-                    self.handle_trade(tick).await;
+                _ = tick_interval.tick() => {
+                    // ✅ FIXED: Check for order timeout (Freeze Protection)
+                    if self.order_in_progress {
+                        if let Some(last_time) = self.last_order_time {
+                            if last_time.elapsed() > Duration::from_secs(10) {
+                                warn!("⚠️  Order execution TIMEOUT after 10s - forcing unfreeze");
+                                self.order_in_progress = false;
+                                self.last_order_time = None;
+                            }
+                        }
+                    }
                 }
-                StrategyMessage::PositionUpdate(position) => {
-                    self.current_position = position;
-                }
-                StrategyMessage::SymbolChanged(new_symbol) => {
-                    self.handle_symbol_change(new_symbol).await;
-                }
-                // ✅ CRITICAL: Feedback from execution
-                StrategyMessage::OrderFilled(symbol) => {
-                    info!("✅ Order filled for {}, unfreezing strategy", symbol);
-                    self.order_in_progress = false;
-                }
-                StrategyMessage::OrderFailed(error) => {
-                    warn!("❌ Order failed: {}, unfreezing strategy", error);
-                    self.order_in_progress = false;
-                    // Also clear position expectation
-                    self.current_position = None;
-                }
+                else => break,
             }
         }
     }
@@ -101,7 +126,9 @@ impl StrategyEngine {
         self.current_position = None;
         self.last_orderbook = None;
         self.tick_buffer = RingBuffer::new(100);
+        self.tick_buffer = RingBuffer::new(100);
         self.order_in_progress = false; // ✅ Reset order lock
+        self.last_order_time = None;
     }
 
     async fn handle_orderbook(&mut self, snapshot: OrderBookSnapshot) {
@@ -282,6 +309,7 @@ impl StrategyEngine {
 
         // ✅ CRITICAL: Lock strategy to prevent order spam
         self.order_in_progress = true;
+        self.last_order_time = Some(Instant::now());
 
         // Send order to execution
         let _ = self

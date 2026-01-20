@@ -59,9 +59,6 @@ impl ScannerActor {
         // Fetch all tickers
         let tickers = self.client.get_tickers("linear").await?;
 
-        // Whitelist for preferred coins (optional boost)
-        let whitelist = vec!["SUI", "WIF", "VIRTUAL", "RENDER", "SEI", "PEPE"];
-
         // Filter and score coins
         let mut candidates: Vec<ScoredCoin> = tickers
             .list
@@ -70,12 +67,22 @@ impl ScannerActor {
                 // Parse symbol
                 let symbol = ticker.symbol.clone();
 
-                // Exclude stablecoins and BTC/ETH
-                if symbol.contains("USDT")
-                    || symbol.contains("USDC")
-                    || symbol.contains("BUSD")
-                    || symbol == "BTCUSDT"
-                    || symbol == "ETHUSDT"
+                // ✅ FIXED: Only accept USDT pairs
+                if !symbol.ends_with("USDT") {
+                    return None;
+                }
+
+                // Exclude BTC/ETH (too stable for scalping)
+                if symbol == "BTCUSDT" || symbol == "ETHUSDT" {
+                    return None;
+                }
+
+                // Exclude stablecoin pairs (USDCUSDT, BUSDUSDT, etc)
+                let base_symbol = symbol.replace("USDT", "");
+                if base_symbol == "USDC"
+                    || base_symbol == "BUSD"
+                    || base_symbol == "DAI"
+                    || base_symbol == "TUSD"
                 {
                     return None;
                 }
@@ -89,14 +96,8 @@ impl ScannerActor {
                     return None;
                 }
 
-                // Calculate volatility score: Turnover * |PriceChange|
-                let mut score = turnover_24h * price_change_24h.abs();
-
-                // Boost whitelisted coins
-                let base_symbol = symbol.replace("USDT", "");
-                if whitelist.contains(&base_symbol.as_str()) {
-                    score *= 1.3; // 30% boost for preferred coins
-                }
+                // ✅ PURE FORMULA: Turnover * |PriceChange| (NO BIAS)
+                let score = turnover_24h * price_change_24h.abs();
 
                 Some(ScoredCoin {
                     symbol,

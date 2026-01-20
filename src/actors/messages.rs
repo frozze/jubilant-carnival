@@ -26,6 +26,12 @@ pub enum StrategyMessage {
     PositionUpdate(Option<Position>),
     /// Symbol switched, close all positions
     SymbolChanged(Symbol),
+
+    // ✅ CRITICAL: Feedback from execution to prevent order spam
+    /// Order successfully placed and filled
+    OrderFilled(Symbol),
+    /// Order placement failed
+    OrderFailed(String),
 }
 
 #[derive(Debug, Clone)]

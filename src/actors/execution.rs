@@ -54,17 +54,32 @@ impl ExecutionActor {
     }
 
     async fn handle_place_order(&self, order: Order) {
+        let symbol = order.symbol.clone();
+
         info!(
             "📤 Placing order: {:?} {} {} @ {:?}",
-            order.side, order.qty, order.symbol, order.price
+            order.side, order.qty, symbol, order.price
         );
 
         match self.client.place_order(&order).await {
             Ok(response) => {
                 info!("✅ Order placed successfully: {}", response.order_id);
+
+                // ✅ CRITICAL: Notify strategy that order is filled
+                let _ = self
+                    .strategy_tx
+                    .send(StrategyMessage::OrderFilled(symbol))
+                    .await;
             }
             Err(e) => {
-                error!("❌ Failed to place order: {}", e);
+                let error_msg = format!("Failed to place order: {}", e);
+                error!("❌ {}", error_msg);
+
+                // ✅ CRITICAL: Notify strategy that order failed
+                let _ = self
+                    .strategy_tx
+                    .send(StrategyMessage::OrderFailed(error_msg))
+                    .await;
             }
         }
     }

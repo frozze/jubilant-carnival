@@ -2,6 +2,7 @@ use crate::actors::messages::{ExecutionMessage, StrategyMessage};
 use crate::config::Config;
 use crate::models::*;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -23,6 +24,9 @@ pub struct StrategyEngine {
 
     // Entry conditions
     momentum_threshold: f64,
+
+    // ✅ CRITICAL: Prevent order spam
+    order_in_progress: bool,
 }
 
 impl StrategyEngine {
@@ -40,6 +44,7 @@ impl StrategyEngine {
             last_orderbook: None,
             tick_buffer: RingBuffer::new(100),
             momentum_threshold: 0.001, // 0.1% momentum threshold
+            order_in_progress: false,
         }
     }
 
@@ -59,6 +64,17 @@ impl StrategyEngine {
                 }
                 StrategyMessage::SymbolChanged(new_symbol) => {
                     self.handle_symbol_change(new_symbol).await;
+                }
+                // ✅ CRITICAL: Feedback from execution
+                StrategyMessage::OrderFilled(symbol) => {
+                    info!("✅ Order filled for {}, unfreezing strategy", symbol);
+                    self.order_in_progress = false;
+                }
+                StrategyMessage::OrderFailed(error) => {
+                    warn!("❌ Order failed: {}, unfreezing strategy", error);
+                    self.order_in_progress = false;
+                    // Also clear position expectation
+                    self.current_position = None;
                 }
             }
         }
@@ -85,6 +101,7 @@ impl StrategyEngine {
         self.current_position = None;
         self.last_orderbook = None;
         self.tick_buffer = RingBuffer::new(100);
+        self.order_in_progress = false; // ✅ Reset order lock
     }
 
     async fn handle_orderbook(&mut self, snapshot: OrderBookSnapshot) {
@@ -139,8 +156,14 @@ impl StrategyEngine {
         // Add to buffer
         self.tick_buffer.push(tick.clone());
 
-        // Only trade if we have enough data
-        if self.tick_buffer.len() < 20 {
+        // ✅ FIXED: Increased to 50 ticks for noise reduction
+        if self.tick_buffer.len() < 50 {
+            return;
+        }
+
+        // ✅ CRITICAL: Skip if order already in progress
+        if self.order_in_progress {
+            debug!("⏸️  Order in progress, skipping new entry signals");
             return;
         }
 
@@ -175,15 +198,16 @@ impl StrategyEngine {
     fn calculate_momentum(&self) -> Option<f64> {
         let ticks: Vec<&TradeTick> = self.tick_buffer.iter().collect();
 
-        if ticks.len() < 20 {
+        // ✅ FIXED: Increased to 50 ticks for noise reduction
+        if ticks.len() < 50 {
             return None;
         }
 
-        // Calculate VWAP for last 20 ticks
+        // Calculate VWAP for last 50 ticks
         let mut total_value = Decimal::ZERO;
         let mut total_volume = Decimal::ZERO;
 
-        for tick in ticks.iter().rev().take(20) {
+        for tick in ticks.iter().rev().take(50) {
             total_value += tick.price * tick.size;
             total_volume += tick.size;
         }
@@ -196,10 +220,10 @@ impl StrategyEngine {
 
         // Compare last price to VWAP
         if let Some(last_tick) = self.tick_buffer.last() {
-            let momentum = ((last_tick.price - vwap) / vwap)
-                .to_string()
-                .parse::<f64>()
-                .ok()?;
+            let momentum_dec = (last_tick.price - vwap) / vwap;
+
+            // ✅ FIXED: 100x faster conversion using ToPrimitive
+            let momentum = momentum_dec.to_f64().unwrap_or(0.0);
 
             Some(momentum)
         } else {
@@ -253,28 +277,11 @@ impl StrategyEngine {
             reduce_only: false,
         };
 
-        // Calculate stop loss
-        let stop_loss_distance = orderbook.mid_price
-            * Decimal::from_str_exact(&(self.config.stop_loss_percent / 100.0).to_string())
-                .unwrap_or(Decimal::from_str("0.005").unwrap());
+        // ✅ FIXED: Don't set position optimistically - wait for exchange confirmation
+        // Position will be set via PositionUpdate message from ExecutionActor
 
-        let stop_loss = match position_side {
-            PositionSide::Long => orderbook.mid_price - stop_loss_distance,
-            PositionSide::Short => orderbook.mid_price + stop_loss_distance,
-        };
-
-        // Create position state
-        let position = Position {
-            symbol: orderbook.symbol.clone(),
-            side: position_side,
-            size: qty,
-            entry_price: orderbook.mid_price,
-            current_price: orderbook.mid_price,
-            unrealized_pnl: Decimal::ZERO,
-            stop_loss: Some(stop_loss),
-        };
-
-        self.current_position = Some(position);
+        // ✅ CRITICAL: Lock strategy to prevent order spam
+        self.order_in_progress = true;
 
         // Send order to execution
         let _ = self

@@ -1,0 +1,169 @@
+use crate::actors::messages::MarketDataMessage;
+use crate::config::Config;
+use crate::exchange::BybitClient;
+use crate::models::Symbol;
+use anyhow::Result;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio::time::{interval, Duration};
+use tracing::{error, info, warn};
+
+/// The "Predator" Scanner - hunts for high-volatility coins
+pub struct ScannerActor {
+    client: BybitClient,
+    config: Arc<Config>,
+    market_data_tx: mpsc::Sender<MarketDataMessage>,
+    current_symbol: Option<Symbol>,
+    current_score: f64,
+}
+
+impl ScannerActor {
+    pub fn new(
+        client: BybitClient,
+        config: Arc<Config>,
+        market_data_tx: mpsc::Sender<MarketDataMessage>,
+    ) -> Self {
+        Self {
+            client,
+            config,
+            market_data_tx,
+            current_symbol: None,
+            current_score: 0.0,
+        }
+    }
+
+    pub async fn run(mut self) {
+        info!("🔍 ScannerActor started");
+
+        let mut scan_interval = interval(Duration::from_secs(self.config.scan_interval_secs));
+
+        // Initial scan
+        if let Err(e) = self.scan_and_select().await {
+            error!("Initial scan failed: {}", e);
+        }
+
+        loop {
+            scan_interval.tick().await;
+
+            if let Err(e) = self.scan_and_select().await {
+                error!("Scan failed: {}", e);
+                // Don't panic, just continue to next iteration
+                continue;
+            }
+        }
+    }
+
+    async fn scan_and_select(&mut self) -> Result<()> {
+        info!("🎯 Starting market scan...");
+
+        // Fetch all tickers
+        let tickers = self.client.get_tickers("linear").await?;
+
+        // Whitelist for preferred coins (optional boost)
+        let whitelist = vec!["SUI", "WIF", "VIRTUAL", "RENDER", "SEI", "PEPE"];
+
+        // Filter and score coins
+        let mut candidates: Vec<ScoredCoin> = tickers
+            .list
+            .iter()
+            .filter_map(|ticker| {
+                // Parse symbol
+                let symbol = ticker.symbol.clone();
+
+                // Exclude stablecoins and BTC/ETH
+                if symbol.contains("USDT")
+                    || symbol.contains("USDC")
+                    || symbol.contains("BUSD")
+                    || symbol == "BTCUSDT"
+                    || symbol == "ETHUSDT"
+                {
+                    return None;
+                }
+
+                // Parse turnover and price change
+                let turnover_24h = ticker.turnover_24h.parse::<f64>().ok()?;
+                let price_change_24h = ticker.price_24h_pcnt.parse::<f64>().ok()?;
+
+                // Filter by minimum turnover
+                if turnover_24h < self.config.min_turnover_24h_usd {
+                    return None;
+                }
+
+                // Calculate volatility score: Turnover * |PriceChange|
+                let mut score = turnover_24h * price_change_24h.abs();
+
+                // Boost whitelisted coins
+                let base_symbol = symbol.replace("USDT", "");
+                if whitelist.contains(&base_symbol.as_str()) {
+                    score *= 1.3; // 30% boost for preferred coins
+                }
+
+                Some(ScoredCoin {
+                    symbol,
+                    score,
+                    turnover_24h,
+                    price_change_24h,
+                })
+            })
+            .collect();
+
+        // Sort by score descending
+        candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+        // Take top coin
+        if let Some(top_coin) = candidates.first() {
+            info!(
+                "📊 Top coin: {} | Score: {:.2e} | Turnover: ${:.2e} | Change: {:.2}%",
+                top_coin.symbol,
+                top_coin.score,
+                top_coin.turnover_24h,
+                top_coin.price_change_24h * 100.0
+            );
+
+            // Check if we should switch
+            let should_switch = if let Some(ref current) = self.current_symbol {
+                // Switch if new score is significantly higher (threshold multiplier)
+                top_coin.score > self.current_score * self.config.score_threshold_multiplier
+                    && top_coin.symbol != current.0
+            } else {
+                // No current symbol, switch to top
+                true
+            };
+
+            if should_switch {
+                info!(
+                    "🔄 Switching to new coin: {} (score: {:.2e} -> {:.2e})",
+                    top_coin.symbol, self.current_score, top_coin.score
+                );
+
+                self.current_symbol = Some(Symbol(top_coin.symbol.clone()));
+                self.current_score = top_coin.score;
+
+                // Send switch command to MarketDataActor
+                if let Err(e) = self
+                    .market_data_tx
+                    .send(MarketDataMessage::SwitchSymbol(Symbol(
+                        top_coin.symbol.clone(),
+                    )))
+                    .await
+                {
+                    error!("Failed to send symbol switch message: {}", e);
+                }
+            } else {
+                info!("✅ Current coin {} still optimal", self.current_symbol.as_ref().unwrap());
+            }
+        } else {
+            warn!("⚠️  No suitable coins found in scan");
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ScoredCoin {
+    symbol: String,
+    score: f64,
+    turnover_24h: f64,
+    price_change_24h: f64,
+}

@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// ExecutionActor - Order placement and position tracking
 pub struct ExecutionActor {
@@ -150,8 +150,14 @@ impl ExecutionActor {
         }
 
         // Timeout - order not filled within 10 seconds
-        let error_msg = format!("Order {} confirmation timeout after 10 seconds", order_id);
-        error!("⏰ {}", error_msg);
+        // ✅ FIX BUG #5: Cancel the orphan order before reporting failure
+        warn!("⏰ Order {} timeout, attempting to cancel...", order_id);
+        if let Err(e) = self.client.cancel_order(&symbol_str, &order_id).await {
+            error!("Failed to cancel timed-out order: {}", e);
+        }
+
+        let error_msg = format!("Order {} cancelled after timeout", order_id);
+        error!("❌ {}", error_msg);
 
         if let Err(e) = self
             .strategy_tx
@@ -170,6 +176,14 @@ impl ExecutionActor {
             Ok(positions) => {
                 if positions.is_empty() {
                     warn!("No position found for {}", symbol);
+                    // ✅ Still send PositionUpdate(None) so Strategy transitions correctly
+                    if let Err(e) = self
+                        .strategy_tx
+                        .send(StrategyMessage::PositionUpdate(None))
+                        .await
+                    {
+                        error!("Failed to send PositionUpdate(None): {}", e);
+                    }
                     return;
                 }
 
@@ -196,7 +210,7 @@ impl ExecutionActor {
                         price: None,
                         time_in_force: TimeInForce::IOC,
                         reduce_only: true,
-                        qty_step: None,  // Market order, precision not critical
+                        qty_step: None,
                         tick_size: None,
                     };
 
@@ -207,19 +221,57 @@ impl ExecutionActor {
 
                     match self.client.place_order(&close_order).await {
                         Ok(response) => {
-                            info!("✅ Position closed: {}", response.order_id);
+                            info!("✅ Close order placed: {}", response.order_id);
 
-                            // Notify strategy
+                            // ✅ FIX BUG #3: Poll for close order confirmation
+                            let max_polls = 10; // 5 seconds for close orders
+                            let poll_interval = tokio::time::Duration::from_millis(500);
+
+                            for attempt in 1..=max_polls {
+                                tokio::time::sleep(poll_interval).await;
+
+                                match self.client.get_order_status(&symbol.0, &response.order_id).await {
+                                    Ok(status) => {
+                                        match status.order_status.as_str() {
+                                            "Filled" => {
+                                                info!("✅ Close order FILLED");
+                                                if let Err(e) = self
+                                                    .strategy_tx
+                                                    .send(StrategyMessage::PositionUpdate(None))
+                                                    .await
+                                                {
+                                                    error!("Failed to send PositionUpdate(None): {}", e);
+                                                }
+                                                return;
+                                            }
+                                            "Cancelled" | "Rejected" => {
+                                                error!("❌ Close order {}: {}", response.order_id, status.order_status);
+                                                // Don't send PositionUpdate - position still exists!
+                                                return;
+                                            }
+                                            _ => continue,
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Close order poll {}/{} failed: {}", attempt, max_polls, e);
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            // Timeout - assume filled for Market IOC
+                            warn!("Close order confirmation timeout, assuming filled");
                             if let Err(e) = self
                                 .strategy_tx
                                 .send(StrategyMessage::PositionUpdate(None))
                                 .await
                             {
-                                error!("Failed to send PositionUpdate(None) after close: {}", e);
+                                error!("Failed to send PositionUpdate(None): {}", e);
                             }
                         }
                         Err(e) => {
                             error!("❌ Failed to close position: {}", e);
+                            // Don't send PositionUpdate - position still exists!
                         }
                     }
                 }
@@ -248,22 +300,39 @@ impl ExecutionActor {
                     let size = Decimal::from_str(&pos_info.size).unwrap_or(Decimal::ZERO);
 
                     if size > Decimal::ZERO {
+                        let entry_price = Decimal::from_str(&pos_info.avg_price)
+                            .unwrap_or(Decimal::ZERO);
+                        let is_long = pos_info.side == "Buy";
+
+                        // ✅ FIX BUG #2: Calculate stop_loss based on config
+                        let sl_percent = Decimal::from_str(&self.config.stop_loss_percent.to_string())
+                            .unwrap_or(Decimal::new(5, 1)); // 0.5% default
+                        let sl_multiplier = Decimal::ONE - (sl_percent / Decimal::from(100));
+                        let sl_multiplier_short = Decimal::ONE + (sl_percent / Decimal::from(100));
+                        
+                        let stop_loss = if is_long {
+                            entry_price * sl_multiplier  // Long: SL below entry
+                        } else {
+                            entry_price * sl_multiplier_short  // Short: SL above entry
+                        };
+
                         let position = Position {
                             symbol: symbol.clone(),
-                            side: if pos_info.side == "Buy" {
+                            side: if is_long {
                                 PositionSide::Long
                             } else {
                                 PositionSide::Short
                             },
                             size,
-                            entry_price: Decimal::from_str(&pos_info.avg_price)
-                                .unwrap_or(Decimal::ZERO),
+                            entry_price,
                             current_price: Decimal::from_str(&pos_info.avg_price)
                                 .unwrap_or(Decimal::ZERO),
                             unrealized_pnl: Decimal::from_str(&pos_info.unrealised_pnl)
                                 .unwrap_or(Decimal::ZERO),
-                            stop_loss: None,
+                            stop_loss: Some(stop_loss),  // ✅ Now properly set!
                         };
+
+                        debug!("📊 Position created: {:?}, SL: {}", position.side, stop_loss);
 
                         if let Err(e) = self
                             .strategy_tx

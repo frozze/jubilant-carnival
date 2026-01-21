@@ -16,6 +16,7 @@ enum StrategyState {
     OrderPending,         // Order sent, waiting for confirmation
     PositionOpen,         // Position confirmed by exchange
     ClosingPosition,      // Close order sent, waiting for confirmation
+    SwitchingSymbol,      // ✅ FIX BUG #1: Closing position before symbol switch
 }
 
 /// StrategyEngine - Impulse/Momentum Scalping with Smart Order Routing
@@ -38,6 +39,9 @@ pub struct StrategyEngine {
 
     // ✅ FIXED: Proper state machine replaces simple boolean
     state: StrategyState,
+
+    // ✅ FIX BUG #1: Store pending symbol change until position is closed
+    pending_symbol_change: Option<(Symbol, SymbolSpecs)>,
 }
 
 impl StrategyEngine {
@@ -57,6 +61,7 @@ impl StrategyEngine {
             tick_buffer: RingBuffer::new(100),
             momentum_threshold: 0.001, // 0.1% momentum threshold
             state: StrategyState::Idle,
+            pending_symbol_change: None, // ✅ FIX BUG #1
         }
     }
 
@@ -86,6 +91,15 @@ impl StrategyEngine {
                             } else if self.state == StrategyState::ClosingPosition {
                                 info!("✅ Position closed, transitioning to Idle");
                                 self.state = StrategyState::Idle;
+                            } else if self.state == StrategyState::SwitchingSymbol {
+                                // ✅ FIX BUG #1: Now complete the pending symbol change
+                                info!("✅ Position closed during symbol switch, completing switch...");
+                                if let Some((new_symbol, specs)) = self.pending_symbol_change.take() {
+                                    self.complete_symbol_switch(new_symbol, specs);
+                                } else {
+                                    warn!("SwitchingSymbol state but no pending change!");
+                                    self.state = StrategyState::Idle;
+                                }
                             }
                         }
                         StrategyMessage::SymbolChanged { symbol: new_symbol, specs } => {
@@ -142,15 +156,16 @@ impl StrategyEngine {
     }
 
     async fn handle_symbol_change(&mut self, new_symbol: Symbol, specs: SymbolSpecs) {
-        info!("🔄 Symbol changed to: {} (qty_step: {}, tick_size: {})",
+        info!("🔄 Symbol change requested: {} (qty_step: {}, tick_size: {})",
               new_symbol, specs.qty_step, specs.tick_size);
 
-        // Close any existing position
+        // ✅ FIX BUG #1: If we have a position, close it FIRST and defer the switch
         if let Some(ref position) = self.current_position {
             info!("⚠️  Closing position on {} before symbol switch", position.symbol);
 
-            // ✅ FIXED: Transition to ClosingPosition state
-            self.state = StrategyState::ClosingPosition;
+            // Store pending symbol change - will be applied after close confirmation
+            self.pending_symbol_change = Some((new_symbol, specs));
+            self.state = StrategyState::SwitchingSymbol;
 
             if let Err(e) = self
                 .execution_tx
@@ -161,17 +176,29 @@ impl StrategyEngine {
                 .await
             {
                 warn!("Failed to send ClosePosition on symbol change: {}", e);
-                // Will reset to Idle below anyway
+                // Fallback: complete switch anyway to avoid getting stuck
+                if let Some((sym, sp)) = self.pending_symbol_change.take() {
+                    self.complete_symbol_switch(sym, sp);
+                }
             }
+            // DON'T switch yet - wait for PositionUpdate(None)
+            return;
         }
 
-        // Reset state
+        // No position - switch immediately
+        self.complete_symbol_switch(new_symbol, specs);
+    }
+
+    /// Complete the symbol switch after position is closed
+    fn complete_symbol_switch(&mut self, new_symbol: Symbol, specs: SymbolSpecs) {
+        info!("✅ Completing symbol switch to: {}", new_symbol);
         self.current_symbol = Some(new_symbol);
         self.current_position = None;
         self.last_orderbook = None;
         self.current_specs = Some(specs);
         self.tick_buffer = RingBuffer::new(100);
-        self.state = StrategyState::Idle; // ✅ Reset state machine
+        self.pending_symbol_change = None;
+        self.state = StrategyState::Idle;
     }
 
     async fn handle_orderbook(&mut self, snapshot: OrderBookSnapshot) {

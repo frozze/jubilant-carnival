@@ -68,6 +68,14 @@ impl MarketDataActor {
 
         let (mut write, mut read) = ws_stream.split();
 
+        // ✅ FIX BUG #4: Re-subscribe to current symbol after reconnect
+        if let Some(ref symbol) = self.current_symbol {
+            info!("🔄 Re-subscribing to {} after reconnect", symbol);
+            if let Err(e) = self.subscribe(&mut write, symbol).await {
+                error!("Failed to re-subscribe to {}: {}", symbol, e);
+            }
+        }
+
         // Ping interval to keep connection alive
         let mut ping_interval = interval(Duration::from_secs(20));
 

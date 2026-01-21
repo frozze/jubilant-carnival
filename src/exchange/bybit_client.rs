@@ -369,6 +369,50 @@ impl BybitClient {
         }
     }
 
+    /// Cancel a single order by order ID
+    /// POST /v5/order/cancel
+    pub async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<()> {
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let url = format!("{}/v5/order/cancel", self.base_url);
+
+        let payload = json!({
+            "category": "linear",
+            "symbol": symbol,
+            "orderId": order_id,
+        });
+
+        let payload_str = serde_json::to_string(&payload)?;
+        let signature = self.sign(timestamp, RECV_WINDOW, &payload_str);
+
+        let response = self
+            .client
+            .post(&url)
+            .header("X-BAPI-API-KEY", &self.api_key)
+            .header("X-BAPI-TIMESTAMP", timestamp.to_string())
+            .header("X-BAPI-SIGN", &signature)
+            .header("X-BAPI-RECV-WINDOW", RECV_WINDOW)
+            .header("Content-Type", "application/json")
+            .body(payload_str)
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            let data: ApiResponse<serde_json::Value> = response.json().await?;
+            if data.ret_code == 0 {
+                debug!("Cancelled order {} for {}", order_id, symbol);
+                Ok(())
+            } else {
+                // Order might already be filled/cancelled - not an error
+                warn!("Cancel order response: {} - {}", data.ret_code, data.ret_msg);
+                Ok(())
+            }
+        } else {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Cancel order failed: {} - {}", status, body);
+        }
+    }
+
     /// Cancel all orders for a symbol (useful for emergency stops)
     #[allow(dead_code)]
     pub async fn cancel_all_orders(&self, symbol: &str) -> Result<()> {

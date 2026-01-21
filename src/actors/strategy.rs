@@ -360,35 +360,41 @@ impl StrategyEngine {
                    position_value / orderbook.mid_price, qty, specs.qty_step);
         }
 
-        // ⚠️ TEMPORARY: Force Market IOC for testing (1-2 days)
-        // TODO: Revert to smart routing after testing
-        // Smart Order Routing based on liquidity (DISABLED FOR TESTING)
-        let (order_type, price, time_in_force) = {
-            // FORCED: Always use Market IOC for guaranteed execution during testing
-            info!("📈 Using Market IOC (FORCED FOR TESTING - will revert to smart routing later)");
+        // ✅ Smart Order Routing with Fallback Protection
+        // Strategy:
+        // - Deeply liquid (spread < 5bps, $500+ on both sides): PostOnly → auto-fallback to Market IOC if not filled in 5s
+        // - Other markets: Market IOC immediately for guaranteed execution
+        let (order_type, price, time_in_force) = if orderbook.is_deeply_liquid() {
+            // Deep liquidity: Try PostOnly for maker rebate
+            // ExecutionActor will auto-fallback to Market IOC if not filled in 5s
+            info!(
+                "📊 Using PostOnly Limit (deep liquidity: spread={:.2}bps, bid_value=${:.0}, ask_value=${:.0}) with auto-fallback",
+                orderbook.spread_bps,
+                (orderbook.bid_size * orderbook.best_bid).to_f64().unwrap_or(0.0),
+                (orderbook.ask_size * orderbook.best_ask).to_f64().unwrap_or(0.0)
+            );
+
+            let mut limit_price = match side {
+                OrderSide::Buy => orderbook.best_bid,
+                OrderSide::Sell => orderbook.best_ask,
+            };
+
+            if let Some(ref specs) = self.current_specs {
+                limit_price = specs.round_price(limit_price);
+                debug!("Rounded price to {} (tick_size: {})", limit_price, specs.tick_size);
+            }
+
+            (OrderType::Limit, Some(limit_price), TimeInForce::PostOnly)
+        } else {
+            // Lower liquidity or wider spread: Use Market IOC for immediate execution
+            info!(
+                "📈 Using Market IOC (spread={:.2}bps, bid_value=${:.0}, ask_value=${:.0}) for guaranteed execution",
+                orderbook.spread_bps,
+                (orderbook.bid_size * orderbook.best_bid).to_f64().unwrap_or(0.0),
+                (orderbook.ask_size * orderbook.best_ask).to_f64().unwrap_or(0.0)
+            );
             (OrderType::Market, None, TimeInForce::IOC)
         };
-
-        // Original smart routing logic (commented out for testing):
-        // let (order_type, price, time_in_force) = if orderbook.is_liquid() {
-        //     // Liquid market: Use aggressive IOC market orders
-        //     info!("📈 Using IOC Market Order (liquid market)");
-        //     (OrderType::Market, None, TimeInForce::IOC)
-        // } else {
-        //     // Wide spread: Try to capture maker rebate with PostOnly limit
-        //     info!("📊 Using PostOnly Limit Order (wide spread)");
-        //     let mut limit_price = match side {
-        //         OrderSide::Buy => orderbook.best_bid,
-        //         OrderSide::Sell => orderbook.best_ask,
-        //     };
-        //
-        //     if let Some(ref specs) = self.current_specs {
-        //         limit_price = specs.round_price(limit_price);
-        //         debug!("Rounded price to {} (tick_size: {})", limit_price, specs.tick_size);
-        //     }
-        //
-        //     (OrderType::Limit, Some(limit_price), TimeInForce::PostOnly)
-        // };
 
         // ✅ Pass symbol specs to order for precision validation
         let (qty_step, tick_size) = if let Some(ref specs) = self.current_specs {

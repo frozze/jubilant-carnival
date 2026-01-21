@@ -83,6 +83,20 @@ impl OrderBookSnapshot {
     pub fn is_liquid(&self) -> bool {
         self.spread_bps < 10.0 && self.bid_size > Decimal::from(100) && self.ask_size > Decimal::from(100)
     }
+
+    /// Check if orderbook is deeply liquid (safe for PostOnly with fallback)
+    /// Stricter requirements: tight spread + substantial size on both sides
+    pub fn is_deeply_liquid(&self) -> bool {
+        // Spread < 5 bps (very tight)
+        // Both sides have at least $500 worth at best price
+        let min_size_usd = Decimal::from(500);
+        let bid_value = self.bid_size * self.best_bid;
+        let ask_value = self.ask_size * self.best_ask;
+
+        self.spread_bps < 5.0
+            && bid_value >= min_size_usd
+            && ask_value >= min_size_usd
+    }
 }
 
 /// Trade tick data

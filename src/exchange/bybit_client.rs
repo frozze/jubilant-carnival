@@ -369,6 +369,54 @@ impl BybitClient {
         }
     }
 
+    /// POST /v5/order/cancel
+    /// Cancel a specific order by order ID
+    pub async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<()> {
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let url = format!("{}/v5/order/cancel", self.base_url);
+
+        let payload = json!({
+            "category": "linear",
+            "symbol": symbol,
+            "orderId": order_id,
+        });
+
+        let payload_str = serde_json::to_string(&payload)?;
+        let signature = self.sign(timestamp, RECV_WINDOW, &payload_str);
+
+        debug!("Cancelling order {}", order_id);
+
+        let response = self
+            .client
+            .post(&url)
+            .header("X-BAPI-API-KEY", &self.api_key)
+            .header("X-BAPI-TIMESTAMP", timestamp.to_string())
+            .header("X-BAPI-SIGN", &signature)
+            .header("X-BAPI-RECV-WINDOW", RECV_WINDOW)
+            .header("Content-Type", "application/json")
+            .body(payload_str)
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            let data: ApiResponse<serde_json::Value> = response
+                .json()
+                .await
+                .context("Failed to parse cancel order response")?;
+
+            if data.ret_code == 0 {
+                debug!("Order {} cancelled successfully", order_id);
+                Ok(())
+            } else {
+                anyhow::bail!("Cancel order failed: {} - {}", data.ret_code, data.ret_msg);
+            }
+        } else {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Cancel order failed: {} - {}", status, body);
+        }
+    }
+
     /// Cancel all orders for a symbol (useful for emergency stops)
     #[allow(dead_code)]
     pub async fn cancel_all_orders(&self, symbol: &str) -> Result<()> {

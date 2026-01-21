@@ -57,10 +57,12 @@ impl ExecutionActor {
     async fn handle_place_order(&self, order: Order) {
         let symbol = order.symbol.clone();
         let symbol_str = symbol.0.clone();
+        let is_post_only = order.time_in_force == TimeInForce::PostOnly;
 
         info!(
-            "📤 Placing order: {:?} {} {} @ {:?}",
-            order.side, order.qty, symbol, order.price
+            "📤 Placing order: {:?} {} {} @ {:?} ({})",
+            order.side, order.qty, symbol, order.price,
+            if is_post_only { "PostOnly" } else { "Market/IOC" }
         );
 
         // Step 1: Place order
@@ -85,18 +87,25 @@ impl ExecutionActor {
             }
         };
 
-        // ✅ FIXED: Step 2 - Poll for order confirmation (up to 10 seconds)
-        let max_polls = 20; // 20 polls × 500ms = 10 seconds
+        // ✅ Step 2 - Poll for order confirmation
+        // PostOnly: 5 seconds timeout then fallback to Market IOC
+        // Market/IOC: 10 seconds timeout (should fill much faster)
+        let initial_timeout_polls = if is_post_only {
+            10 // 5s PostOnly timeout before fallback
+        } else {
+            20 // 10s total for Market/IOC
+        };
+
         let poll_interval = tokio::time::Duration::from_millis(500);
 
-        for attempt in 1..=max_polls {
+        for attempt in 1..=initial_timeout_polls {
             tokio::time::sleep(poll_interval).await;
 
             match self.client.get_order_status(&symbol_str, &order_id).await {
                 Ok(order_status) => {
                     info!(
                         "📊 Order {} status: {} (attempt {}/{})",
-                        order_id, order_status.order_status, attempt, max_polls
+                        order_id, order_status.order_status, attempt, initial_timeout_polls
                     );
 
                     match order_status.order_status.as_str() {
@@ -142,23 +151,121 @@ impl ExecutionActor {
                 Err(e) => {
                     warn!(
                         "Failed to query order status (attempt {}/{}): {}",
-                        attempt, max_polls, e
+                        attempt, initial_timeout_polls, e
                     );
                     continue;
                 }
             }
         }
 
-        // Timeout - order not filled within 10 seconds
-        let error_msg = format!("Order {} confirmation timeout after 10 seconds", order_id);
-        error!("⏰ {}", error_msg);
+        // ✅ FALLBACK: PostOnly didn't fill within 5 seconds
+        if is_post_only {
+            warn!("⚠️  PostOnly order {} not filled after 5s, falling back to Market IOC", order_id);
 
-        if let Err(e) = self
-            .strategy_tx
-            .send(StrategyMessage::OrderFailed(error_msg))
-            .await
-        {
-            error!("Failed to send OrderFailed message: {}", e);
+            // Cancel the PostOnly order
+            match self.client.cancel_order(&symbol_str, &order_id).await {
+                Ok(_) => {
+                    info!("✅ Cancelled PostOnly order {}", order_id);
+                }
+                Err(e) => {
+                    // Order might already be filled/cancelled, check status
+                    warn!("Failed to cancel PostOnly order {}: {}", order_id, e);
+
+                    // Double-check status before fallback
+                    if let Ok(status) = self.client.get_order_status(&symbol_str, &order_id).await {
+                        if status.order_status == "Filled" {
+                            info!("✅ PostOnly order {} was FILLED during cancel", order_id);
+                            if let Err(e) = self.strategy_tx.send(StrategyMessage::OrderFilled(symbol.clone())).await {
+                                error!("Failed to send OrderFilled: {}", e);
+                            }
+                            self.handle_get_position(symbol).await;
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // Create fallback Market IOC order
+            info!("🔄 Placing fallback Market IOC order");
+            let fallback_order = Order {
+                symbol: order.symbol.clone(),
+                side: order.side,
+                order_type: OrderType::Market,
+                qty: order.qty,
+                price: None,
+                time_in_force: TimeInForce::IOC,
+                reduce_only: order.reduce_only,
+                qty_step: order.qty_step,
+                tick_size: order.tick_size,
+            };
+
+            let fallback_order_id = match self.client.place_order(&fallback_order).await {
+                Ok(response) => {
+                    info!("✅ Fallback Market IOC order accepted: {}", response.order_id);
+                    response.order_id
+                }
+                Err(e) => {
+                    let error_msg = format!("Failed to place fallback Market IOC order: {}", e);
+                    error!("❌ {}", error_msg);
+                    if let Err(e) = self.strategy_tx.send(StrategyMessage::OrderFailed(error_msg)).await {
+                        error!("Failed to send OrderFailed: {}", e);
+                    }
+                    return;
+                }
+            };
+
+            // Poll fallback order (should fill quickly)
+            for attempt in 1..=10 {
+                tokio::time::sleep(poll_interval).await;
+
+                match self.client.get_order_status(&symbol_str, &fallback_order_id).await {
+                    Ok(order_status) => {
+                        info!(
+                            "📊 Fallback order {} status: {} (attempt {}/10)",
+                            fallback_order_id, order_status.order_status, attempt
+                        );
+
+                        match order_status.order_status.as_str() {
+                            "Filled" => {
+                                info!("✅ Fallback order {} FILLED", fallback_order_id);
+                                if let Err(e) = self.strategy_tx.send(StrategyMessage::OrderFilled(symbol.clone())).await {
+                                    error!("Failed to send OrderFilled: {}", e);
+                                }
+                                self.handle_get_position(symbol).await;
+                                return;
+                            }
+                            "Cancelled" | "Rejected" => {
+                                let error_msg = format!("Fallback order {} {}", fallback_order_id, order_status.order_status);
+                                error!("❌ {}", error_msg);
+                                if let Err(e) = self.strategy_tx.send(StrategyMessage::OrderFailed(error_msg)).await {
+                                    error!("Failed to send OrderFailed: {}", e);
+                                }
+                                return;
+                            }
+                            _ => continue,
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to query fallback order status: {}", e);
+                        continue;
+                    }
+                }
+            }
+
+            // Fallback order also timed out
+            let error_msg = format!("Fallback Market IOC order {} timeout", fallback_order_id);
+            error!("⏰ {}", error_msg);
+            if let Err(e) = self.strategy_tx.send(StrategyMessage::OrderFailed(error_msg)).await {
+                error!("Failed to send OrderFailed: {}", e);
+            }
+            return;
+        }
+
+        // Market/IOC order timed out (shouldn't happen often)
+        let error_msg = format!("Market/IOC order {} timeout after 10 seconds", order_id);
+        error!("⏰ {}", error_msg);
+        if let Err(e) = self.strategy_tx.send(StrategyMessage::OrderFailed(error_msg)).await {
+            error!("Failed to send OrderFailed: {}", e);
         }
     }
 

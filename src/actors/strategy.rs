@@ -115,11 +115,13 @@ impl StrategyEngine {
                                         let pnl_pct = pnl_decimal.to_f64().unwrap_or(0.0) * 100.0;
 
                                         if pnl_pct < 0.0 {
-                                            warn!("📉 Position closed with LOSS: {:.2}%, adding {} to cooldown (10 min)",
-                                                  pnl_pct, symbol);
+                                            let cooldown_mins = self.config.loss_cooldown_minutes;
+                                            warn!("📉 Position closed with LOSS: {:.2}%, adding {} to cooldown ({} min)",
+                                                  pnl_pct, symbol, cooldown_mins);
 
-                                            // Add to cooldown for 10 minutes
-                                            let cooldown_until = Instant::now() + Duration::from_secs(600);
+                                            // Add to cooldown (configurable duration)
+                                            let cooldown_secs = cooldown_mins * 60;
+                                            let cooldown_until = Instant::now() + Duration::from_secs(cooldown_secs);
                                             self.loss_cooldown.insert(symbol.0.clone(), cooldown_until);
 
                                             // Send Telegram alert
@@ -127,8 +129,8 @@ impl StrategyEngine {
                                                 alerter.warning(
                                                     "📉 Loss Cooldown",
                                                     format!(
-                                                        "Symbol: {}\nClosed with: {:.2}%\nCooldown: 10 minutes\nWill not re-enter this symbol for safety.",
-                                                        symbol, pnl_pct
+                                                        "Symbol: {}\nClosed with: {:.2}%\nCooldown: {} minutes\nWill not re-enter this symbol for safety.",
+                                                        symbol, pnl_pct, cooldown_mins
                                                     ),
                                                 );
                                             }

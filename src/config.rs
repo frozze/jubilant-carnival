@@ -26,6 +26,9 @@ pub struct Config {
     pub max_spread_bps: f64,
     pub stale_data_threshold_ms: i64,
 
+    // Loss protection
+    pub loss_cooldown_minutes: u64,
+
     // Telegram alerts (optional)
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_id: Option<String>,
@@ -83,6 +86,12 @@ impl Config {
                 .unwrap_or_else(|_| "500".to_string())
                 .parse()
                 .unwrap_or(500),
+
+            // Loss protection
+            loss_cooldown_minutes: env::var("LOSS_COOLDOWN_MINUTES")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()
+                .unwrap_or(10),
 
             // Telegram alerts (optional)
             telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN").ok(),

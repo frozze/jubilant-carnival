@@ -68,7 +68,11 @@ pub struct StrategyEngine {
     cached_vwap_short: Option<Decimal>,  // 50-tick VWAP
     cached_vwap_long: Option<Decimal>,   // 200-tick VWAP
     cached_volatility: Option<f64>,      // 100-tick volatility
-    last_cache_update: usize,            // tick_buffer.len() when cache was updated
+    /// CRITICAL: Use tick counter instead of buffer.len()!
+    /// RingBuffer.len() stays constant when full (300), so len-based
+    /// invalidation would STOP working after 300 ticks!
+    tick_counter: usize,                 // Total ticks processed (never resets)
+    last_cache_update: usize,            // tick_counter when cache was last updated
 }
 
 impl StrategyEngine {
@@ -102,6 +106,7 @@ impl StrategyEngine {
             cached_vwap_short: None,
             cached_vwap_long: None,
             cached_volatility: None,
+            tick_counter: 0,
             last_cache_update: 0,
         }
     }
@@ -150,6 +155,17 @@ impl StrategyEngine {
                                     warn!("SwitchingSymbol state but no pending change!");
                                     self.state = StrategyState::Idle;
                                 }
+                            } else if position.is_none() {
+                                // ✅ FIX BUG #9: Position disappeared unexpectedly (liquidation, margin call, etc.)
+                                // CRITICAL: If we're in OrderPending or any other state and position vanishes,
+                                // we must reset to Idle or we'll be stuck forever!
+                                warn!(
+                                    "⚠️  Position disappeared unexpectedly in state {:?} (liquidation? margin call?). Resetting to Idle.",
+                                    self.state
+                                );
+                                self.state = StrategyState::Idle;
+                                self.active_dynamic_risk = None;
+                                self.last_trade_time = Some(Instant::now());
                             }
                         }
                         StrategyMessage::SymbolChanged { symbol: new_symbol, specs, price_change_24h } => {
@@ -267,6 +283,7 @@ impl StrategyEngine {
         self.cached_vwap_short = None;
         self.cached_vwap_long = None;
         self.cached_volatility = None;
+        self.tick_counter = 0;
         self.last_cache_update = 0;
     }
 
@@ -286,13 +303,24 @@ impl StrategyEngine {
         if let Some(ref mut position) = self.current_position {
             position.current_price = snapshot.mid_price;
 
-            // Check stop loss
-            if position.should_stop_loss() {
+            // ✅ FIX CRITICAL BUG #8: Use active dynamic risk for BOTH SL and TP, not position.stop_loss!
+            // CRITICAL: position.stop_loss is set by ExecutionActor using static config value,
+            // but we calculated dynamic SL/TP in execute_entry()!
+            // Using position.should_stop_loss() would check WRONG (static) SL!
+            let (sl_target, tp_target) = self.active_dynamic_risk
+                .unwrap_or((self.config.stop_loss_percent, self.config.take_profit_percent));
+
+            let pnl_pct = position.pnl_percent();
+
+            // Check stop loss using dynamic SL target
+            if pnl_pct <= -sl_target {
                 warn!(
-                    "🛑 STOP LOSS triggered for {} at {} (PnL: {:.2}%)",
+                    "🛑 STOP LOSS triggered for {} at {} (PnL: {:.2}% | Target: -{:.2}% {})",
                     position.symbol,
                     position.current_price,
-                    position.pnl_percent()
+                    pnl_pct,
+                    sl_target,
+                    if self.active_dynamic_risk.is_some() { "[Dynamic]" } else { "[Static]" }
                 );
 
                 // ✅ FIXED: Transition to ClosingPosition state
@@ -313,13 +341,7 @@ impl StrategyEngine {
                 return;
             }
 
-            // ✅ FIX MEMORY LOSS BUG: Use active dynamic risk, not config
-            // Get the effective TP target for this position
-            let (_sl_target, tp_target) = self.active_dynamic_risk
-                .unwrap_or((self.config.stop_loss_percent, self.config.take_profit_percent));
-
-            // Check take profit
-            let pnl_pct = position.pnl_percent();
+            // Check take profit using dynamic TP target
             if pnl_pct >= tp_target {
                 info!(
                     "💰 TAKE PROFIT hit for {} (PnL: {:.2}% | Target: {:.2}% {})",
@@ -373,13 +395,15 @@ impl StrategyEngine {
         self.tick_buffer.push(tick.clone());
 
         // ✅ PERFORMANCE: Invalidate VWAP cache on new tick
-        // Will be recalculated on next access (lazy evaluation)
-        let current_buffer_len = self.tick_buffer.len();
-        if current_buffer_len != self.last_cache_update {
+        // CRITICAL FIX: Use tick_counter instead of buffer.len()!
+        // RingBuffer.len() stays constant when full (300), so len-based
+        // invalidation would STOP working after 300 ticks!
+        self.tick_counter += 1;
+        if self.tick_counter != self.last_cache_update {
             self.cached_vwap_short = None;
             self.cached_vwap_long = None;
             self.cached_volatility = None;
-            self.last_cache_update = current_buffer_len;
+            self.last_cache_update = self.tick_counter;
         }
 
         // ✅ FLASH CRASH PROTECTION: Detect extreme price movements

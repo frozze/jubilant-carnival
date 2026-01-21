@@ -68,7 +68,11 @@ pub struct StrategyEngine {
     cached_vwap_short: Option<Decimal>,  // 50-tick VWAP
     cached_vwap_long: Option<Decimal>,   // 200-tick VWAP
     cached_volatility: Option<f64>,      // 100-tick volatility
-    last_cache_update: usize,            // tick_buffer.len() when cache was updated
+    /// CRITICAL: Use tick counter instead of buffer.len()!
+    /// RingBuffer.len() stays constant when full (300), so len-based
+    /// invalidation would STOP working after 300 ticks!
+    tick_counter: usize,                 // Total ticks processed (never resets)
+    last_cache_update: usize,            // tick_counter when cache was last updated
 }
 
 impl StrategyEngine {
@@ -102,6 +106,7 @@ impl StrategyEngine {
             cached_vwap_short: None,
             cached_vwap_long: None,
             cached_volatility: None,
+            tick_counter: 0,
             last_cache_update: 0,
         }
     }
@@ -150,6 +155,17 @@ impl StrategyEngine {
                                     warn!("SwitchingSymbol state but no pending change!");
                                     self.state = StrategyState::Idle;
                                 }
+                            } else if position.is_none() {
+                                // ✅ FIX BUG #9: Position disappeared unexpectedly (liquidation, margin call, etc.)
+                                // CRITICAL: If we're in OrderPending or any other state and position vanishes,
+                                // we must reset to Idle or we'll be stuck forever!
+                                warn!(
+                                    "⚠️  Position disappeared unexpectedly in state {:?} (liquidation? margin call?). Resetting to Idle.",
+                                    self.state
+                                );
+                                self.state = StrategyState::Idle;
+                                self.active_dynamic_risk = None;
+                                self.last_trade_time = Some(Instant::now());
                             }
                         }
                         StrategyMessage::SymbolChanged { symbol: new_symbol, specs, price_change_24h } => {
@@ -267,6 +283,7 @@ impl StrategyEngine {
         self.cached_vwap_short = None;
         self.cached_vwap_long = None;
         self.cached_volatility = None;
+        self.tick_counter = 0;
         self.last_cache_update = 0;
     }
 
@@ -286,13 +303,24 @@ impl StrategyEngine {
         if let Some(ref mut position) = self.current_position {
             position.current_price = snapshot.mid_price;
 
-            // Check stop loss
-            if position.should_stop_loss() {
+            // ✅ FIX CRITICAL BUG #8: Use active dynamic risk for BOTH SL and TP, not position.stop_loss!
+            // CRITICAL: position.stop_loss is set by ExecutionActor using static config value,
+            // but we calculated dynamic SL/TP in execute_entry()!
+            // Using position.should_stop_loss() would check WRONG (static) SL!
+            let (sl_target, tp_target) = self.active_dynamic_risk
+                .unwrap_or((self.config.stop_loss_percent, self.config.take_profit_percent));
+
+            let pnl_pct = position.pnl_percent();
+
+            // Check stop loss using dynamic SL target
+            if pnl_pct <= -sl_target {
                 warn!(
-                    "🛑 STOP LOSS triggered for {} at {} (PnL: {:.2}%)",
+                    "🛑 STOP LOSS triggered for {} at {} (PnL: {:.2}% | Target: -{:.2}% {})",
                     position.symbol,
                     position.current_price,
-                    position.pnl_percent()
+                    pnl_pct,
+                    sl_target,
+                    if self.active_dynamic_risk.is_some() { "[Dynamic]" } else { "[Static]" }
                 );
 
                 // ✅ FIXED: Transition to ClosingPosition state
@@ -313,13 +341,7 @@ impl StrategyEngine {
                 return;
             }
 
-            // ✅ FIX MEMORY LOSS BUG: Use active dynamic risk, not config
-            // Get the effective TP target for this position
-            let (_sl_target, tp_target) = self.active_dynamic_risk
-                .unwrap_or((self.config.stop_loss_percent, self.config.take_profit_percent));
-
-            // Check take profit
-            let pnl_pct = position.pnl_percent();
+            // Check take profit using dynamic TP target
             if pnl_pct >= tp_target {
                 info!(
                     "💰 TAKE PROFIT hit for {} (PnL: {:.2}% | Target: {:.2}% {})",
@@ -373,26 +395,39 @@ impl StrategyEngine {
         self.tick_buffer.push(tick.clone());
 
         // ✅ PERFORMANCE: Invalidate VWAP cache on new tick
-        // Will be recalculated on next access (lazy evaluation)
-        let current_buffer_len = self.tick_buffer.len();
-        if current_buffer_len != self.last_cache_update {
+        // CRITICAL FIX: Use tick_counter instead of buffer.len()!
+        // RingBuffer.len() stays constant when full (300), so len-based
+        // invalidation would STOP working after 300 ticks!
+        self.tick_counter += 1;
+        if self.tick_counter != self.last_cache_update {
             self.cached_vwap_short = None;
             self.cached_vwap_long = None;
             self.cached_volatility = None;
-            self.last_cache_update = current_buffer_len;
+            self.last_cache_update = self.tick_counter;
         }
 
         // ✅ FLASH CRASH PROTECTION: Detect extreme price movements
         // If we have an open position and price moves >5% in 1 second, emergency exit
         if let Some(ref mut position) = self.current_position {
-            // ✅ FIX: Update current_price from latest trade tick BEFORE checking PnL
-            // CRITICAL: position.current_price is updated in handle_orderbook(),
-            // but flash crash check happens in handle_trade() → stale price!
-            if let Some(last_tick) = self.tick_buffer.last() {
-                position.current_price = last_tick.price;
-            }
+            // ✅ FIX RACE CONDITION: Use last_tick price ONLY for flash crash check,
+            // don't update position.current_price here (it's authoritative from orderbook)
+            // Calculate PnL using latest tick price for flash crash detection
+            let last_price = if let Some(last_tick) = self.tick_buffer.last() {
+                last_tick.price
+            } else {
+                position.current_price  // Fallback to current price
+            };
 
-            let pnl_pct = position.pnl_percent();
+            // Temporarily calculate PnL with latest tick price (don't modify position)
+            let pnl_pct = if position.entry_price > Decimal::ZERO {
+                let pnl_ratio = match position.side {
+                    PositionSide::Long => (last_price - position.entry_price) / position.entry_price,
+                    PositionSide::Short => (position.entry_price - last_price) / position.entry_price,
+                };
+                (pnl_ratio * Decimal::from(100)).to_f64().unwrap_or(0.0)
+            } else {
+                0.0
+            };
 
             // Emergency exit on flash crash (>5% adverse move)
             const FLASH_CRASH_THRESHOLD: f64 = -5.0; // -5% sudden loss
@@ -576,10 +611,14 @@ impl StrategyEngine {
                             if let Some(ref orderbook) = self.last_orderbook {
                                 // Check spread is reasonable
                                 if orderbook.spread_bps > self.config.max_spread_bps {
-                                    debug!(
-                                        "Spread too wide: {:.2} bps (max: {:.2})",
+                                    warn!(
+                                        "⚠️  Entry blocked: Spread too wide {:.2} bps (max: {:.2}). Resetting confirmation.",
                                         orderbook.spread_bps, self.config.max_spread_bps
                                     );
+                                    // ✅ FIX: Reset confirmation state when spread too wide
+                                    // CRITICAL: Market conditions changed, signal may be invalid
+                                    self.pending_signal = None;
+                                    self.confirmation_count = 0;
                                     return;
                                 }
 

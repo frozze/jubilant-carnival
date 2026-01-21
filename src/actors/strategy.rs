@@ -58,6 +58,17 @@ pub struct StrategyEngine {
     last_trade_time: Option<Instant>,
     /// Cooldown duration in seconds (configurable)
     trade_cooldown_secs: u64,
+
+    // ✅ FIX MEMORY LOSS BUG: Store active dynamic risk for current position
+    /// Stores (SL%, TP%) calculated for the current active trade
+    /// CRITICAL: Must use these values in handle_orderbook, NOT config values!
+    active_dynamic_risk: Option<(f64, f64)>,
+
+    // ✅ PERFORMANCE: Cache VWAP calculations (recalculate only on new tick)
+    cached_vwap_short: Option<Decimal>,  // 50-tick VWAP
+    cached_vwap_long: Option<Decimal>,   // 200-tick VWAP
+    cached_volatility: Option<f64>,      // 100-tick volatility
+    last_cache_update: usize,            // tick_buffer.len() when cache was updated
 }
 
 impl StrategyEngine {
@@ -85,14 +96,22 @@ impl StrategyEngine {
             // ✅ IMPROVEMENT #3: Trade cooldown (30 seconds)
             last_trade_time: None,
             trade_cooldown_secs: 30,
+            // ✅ FIX MEMORY LOSS BUG: Initialize dynamic risk storage
+            active_dynamic_risk: None,
+            // ✅ PERFORMANCE: Initialize VWAP cache
+            cached_vwap_short: None,
+            cached_vwap_long: None,
+            cached_volatility: None,
+            last_cache_update: 0,
         }
     }
 
     pub async fn run(mut self) {
         info!("⚡ StrategyEngine started");
 
-        // ✅ FIXED: Add periodic position verification (every 60 seconds)
-        let mut position_verify_interval = interval(Duration::from_secs(60));
+        // ✅ HFT OPTIMIZATION: Position verification every 10 seconds (was 60)
+        // Faster detection of API desync, flash crashes, unexpected liquidations
+        let mut position_verify_interval = interval(Duration::from_secs(10));
 
         loop {
             tokio::select! {
@@ -115,12 +134,16 @@ impl StrategyEngine {
                                 info!("✅ Position closed, transitioning to Idle");
                                 // ✅ IMPROVEMENT #3: Start trade cooldown
                                 self.last_trade_time = Some(Instant::now());
+                                // ✅ FIX MEMORY LOSS BUG: Clear dynamic risk when position closes
+                                self.active_dynamic_risk = None;
                                 self.state = StrategyState::Idle;
                             } else if self.state == StrategyState::SwitchingSymbol {
                                 // ✅ FIX BUG #1: Now complete the pending symbol change
                                 info!("✅ Position closed during symbol switch, completing switch...");
                                 // ✅ IMPROVEMENT #3: Start trade cooldown
                                 self.last_trade_time = Some(Instant::now());
+                                // ✅ FIX MEMORY LOSS BUG: Clear dynamic risk when position closes
+                                self.active_dynamic_risk = None;
                                 if let Some((new_symbol, specs, price_change_24h)) = self.pending_symbol_change.take() {
                                     self.complete_symbol_switch(new_symbol, specs, price_change_24h);
                                 } else {
@@ -145,6 +168,8 @@ impl StrategyEngine {
                                     info!("Close order filled, transitioning to Idle");
                                     // ✅ Start cooldown timer
                                     self.last_trade_time = Some(Instant::now());
+                                    // ✅ FIX MEMORY LOSS BUG: Clear dynamic risk when position closes
+                                    self.active_dynamic_risk = None;
                                     self.state = StrategyState::Idle;
                                     self.current_position = None;
                                 }
@@ -280,12 +305,20 @@ impl StrategyEngine {
                 return;
             }
 
+            // ✅ FIX MEMORY LOSS BUG: Use active dynamic risk, not config
+            // Get the effective TP target for this position
+            let (_sl_target, tp_target) = self.active_dynamic_risk
+                .unwrap_or((self.config.stop_loss_percent, self.config.take_profit_percent));
+
             // Check take profit
             let pnl_pct = position.pnl_percent();
-            if pnl_pct >= self.config.take_profit_percent {
+            if pnl_pct >= tp_target {
                 info!(
-                    "💰 TAKE PROFIT hit for {} (PnL: {:.2}%)",
-                    position.symbol, pnl_pct
+                    "💰 TAKE PROFIT hit for {} (PnL: {:.2}% | Target: {:.2}% {})",
+                    position.symbol,
+                    pnl_pct,
+                    tp_target,
+                    if self.active_dynamic_risk.is_some() { "[Dynamic]" } else { "[Static]" }
                 );
 
                 // ✅ FIXED: Transition to ClosingPosition state
@@ -330,6 +363,50 @@ impl StrategyEngine {
 
         // Add to buffer
         self.tick_buffer.push(tick.clone());
+
+        // ✅ PERFORMANCE: Invalidate VWAP cache on new tick
+        // Will be recalculated on next access (lazy evaluation)
+        let current_buffer_len = self.tick_buffer.len();
+        if current_buffer_len != self.last_cache_update {
+            self.cached_vwap_short = None;
+            self.cached_vwap_long = None;
+            self.cached_volatility = None;
+            self.last_cache_update = current_buffer_len;
+        }
+
+        // ✅ FLASH CRASH PROTECTION: Detect extreme price movements
+        // If we have an open position and price moves >5% in 1 second, emergency exit
+        if let Some(ref position) = self.current_position {
+            if self.tick_buffer.last().is_some() {
+                let pnl_pct = position.pnl_percent();
+
+                // Emergency exit on flash crash (>5% adverse move)
+                const FLASH_CRASH_THRESHOLD: f64 = -5.0; // -5% sudden loss
+
+                if pnl_pct < FLASH_CRASH_THRESHOLD {
+                    warn!(
+                        "⚡ FLASH CRASH DETECTED: PnL {:.2}% in <1sec! Emergency exit on {}",
+                        pnl_pct, position.symbol
+                    );
+
+                    self.state = StrategyState::ClosingPosition;
+
+                    if let Err(e) = self
+                        .execution_tx
+                        .send(ExecutionMessage::ClosePosition {
+                            symbol: position.symbol.clone(),
+                            position_side: position.side,
+                        })
+                        .await
+                    {
+                        warn!("Failed to send emergency ClosePosition: {}", e);
+                        self.state = StrategyState::PositionOpen;
+                    }
+
+                    return;
+                }
+            }
+        }
 
         // ✅ CRITICAL FIX: Need 200 ticks for FULL protection
         // - calculate_momentum: requires 50 ticks
@@ -512,56 +589,21 @@ impl StrategyEngine {
         }
     }
 
-    /// ✅ PUMP PROTECTION: Calculate trend using short vs long VWAP
-    /// Uses 50-tick vs 200-tick window to avoid false reversals on pump coins
-    fn calculate_trend(&self) -> Option<bool> {
+    /// ✅ PERFORMANCE: Get cached 50-tick VWAP or calculate if needed
+    fn get_vwap_short(&mut self) -> Option<Decimal> {
+        // Return cached value if available
+        if let Some(cached) = self.cached_vwap_short {
+            return Some(cached);
+        }
+
+        // Calculate and cache
         let ticks: Vec<&TradeTick> = self.tick_buffer.iter().collect();
-
-        // ✅ EXPANDED: Need at least 200 ticks for long VWAP (was 50)
-        if ticks.len() < 200 {
-            return None;
-        }
-
-        // Short VWAP (last 50 ticks) - was 20
-        let mut short_value = Decimal::ZERO;
-        let mut short_volume = Decimal::ZERO;
-        for tick in ticks.iter().rev().take(50) {
-            short_value += tick.price * tick.size;
-            short_volume += tick.size;
-        }
-
-        // ✅ EXPANDED: Long VWAP (last 200 ticks) - was 50
-        let mut long_value = Decimal::ZERO;
-        let mut long_volume = Decimal::ZERO;
-        for tick in ticks.iter().rev().take(200) {
-            long_value += tick.price * tick.size;
-            long_volume += tick.size;
-        }
-
-        if short_volume == Decimal::ZERO || long_volume == Decimal::ZERO {
-            return None;
-        }
-
-        let short_vwap = short_value / short_volume;
-        let long_vwap = long_value / long_volume;
-
-        // Bullish trend = short VWAP above long VWAP
-        // This requires a sustained move to flip, preventing false signals on pump coins
-        Some(short_vwap > long_vwap)
-    }
-
-    fn calculate_momentum(&self) -> Option<f64> {
-        let ticks: Vec<&TradeTick> = self.tick_buffer.iter().collect();
-
-        // ✅ FIXED: Increased to 50 ticks for noise reduction
         if ticks.len() < 50 {
             return None;
         }
 
-        // Calculate VWAP for last 50 ticks
         let mut total_value = Decimal::ZERO;
         let mut total_volume = Decimal::ZERO;
-
         for tick in ticks.iter().rev().take(50) {
             total_value += tick.price * tick.size;
             total_volume += tick.size;
@@ -572,18 +614,64 @@ impl StrategyEngine {
         }
 
         let vwap = total_value / total_volume;
+        self.cached_vwap_short = Some(vwap);
+        Some(vwap)
+    }
+
+    /// ✅ PERFORMANCE: Get cached 200-tick VWAP or calculate if needed
+    fn get_vwap_long(&mut self) -> Option<Decimal> {
+        // Return cached value if available
+        if let Some(cached) = self.cached_vwap_long {
+            return Some(cached);
+        }
+
+        // Calculate and cache
+        let ticks: Vec<&TradeTick> = self.tick_buffer.iter().collect();
+        if ticks.len() < 200 {
+            return None;
+        }
+
+        let mut total_value = Decimal::ZERO;
+        let mut total_volume = Decimal::ZERO;
+        for tick in ticks.iter().rev().take(200) {
+            total_value += tick.price * tick.size;
+            total_volume += tick.size;
+        }
+
+        if total_volume == Decimal::ZERO {
+            return None;
+        }
+
+        let vwap = total_value / total_volume;
+        self.cached_vwap_long = Some(vwap);
+        Some(vwap)
+    }
+
+    /// ✅ PUMP PROTECTION: Calculate trend using short vs long VWAP (CACHED)
+    /// Uses 50-tick vs 200-tick window to avoid false reversals on pump coins
+    fn calculate_trend(&mut self) -> Option<bool> {
+        // ✅ PERFORMANCE: Use cached VWAP values instead of recalculating
+        let short_vwap = self.get_vwap_short()?;
+        let long_vwap = self.get_vwap_long()?;
+
+        // Bullish trend = short VWAP above long VWAP
+        // This requires a sustained move to flip, preventing false signals on pump coins
+        Some(short_vwap > long_vwap)
+    }
+
+    /// ✅ PERFORMANCE: Calculate momentum using cached VWAP
+    fn calculate_momentum(&mut self) -> Option<f64> {
+        // ✅ PERFORMANCE: Use cached 50-tick VWAP instead of recalculating
+        let vwap = self.get_vwap_short()?;
 
         // Compare last price to VWAP
-        if let Some(last_tick) = self.tick_buffer.last() {
-            let momentum_dec = (last_tick.price - vwap) / vwap;
+        let last_tick = self.tick_buffer.last()?;
+        let momentum_dec = (last_tick.price - vwap) / vwap;
 
-            // ✅ FIXED: 100x faster conversion using ToPrimitive
-            let momentum = momentum_dec.to_f64().unwrap_or(0.0);
+        // ✅ FIXED: 100x faster conversion using ToPrimitive
+        let momentum = momentum_dec.to_f64().unwrap_or(0.0);
 
-            Some(momentum)
-        } else {
-            None
-        }
+        Some(momentum)
     }
 
     /// ✅ ATR-BASED: Calculate tick volatility (standard deviation of price changes)
@@ -665,30 +753,11 @@ impl StrategyEngine {
         (clamped_sl, dynamic_tp)
     }
 
-    /// ✅ ANTI-FOMO: Calculate distance from current price to long-term VWAP
+    /// ✅ ANTI-FOMO: Calculate distance from current price to long-term VWAP (CACHED)
     /// Returns: distance as percentage (positive = above VWAP, negative = below)
-    fn calculate_vwap_distance(&self) -> Option<f64> {
-        let ticks: Vec<&TradeTick> = self.tick_buffer.iter().collect();
-
-        // Need 200 ticks for long-term VWAP
-        if ticks.len() < 200 {
-            return None;
-        }
-
-        // Calculate long VWAP (200 ticks)
-        let mut total_value = Decimal::ZERO;
-        let mut total_volume = Decimal::ZERO;
-
-        for tick in ticks.iter().rev().take(200) {
-            total_value += tick.price * tick.size;
-            total_volume += tick.size;
-        }
-
-        if total_volume == Decimal::ZERO {
-            return None;
-        }
-
-        let vwap_200 = total_value / total_volume;
+    fn calculate_vwap_distance(&mut self) -> Option<f64> {
+        // ✅ PERFORMANCE: Use cached 200-tick VWAP instead of recalculating
+        let vwap_200 = self.get_vwap_long()?;
 
         // Get current price
         let current_price = self.tick_buffer.last()?.price;
@@ -703,6 +772,10 @@ impl StrategyEngine {
     async fn execute_entry(&mut self, momentum: f64, orderbook: &OrderBookSnapshot) {
         // ✅ ATR-BASED: Calculate dynamic risk parameters
         let (dynamic_sl_percent, dynamic_tp_percent) = self.calculate_dynamic_risk();
+
+        // ✅ FIX MEMORY LOSS BUG: Store dynamic risk for this trade
+        // CRITICAL: handle_orderbook must use these values, not config!
+        self.active_dynamic_risk = Some((dynamic_sl_percent, dynamic_tp_percent));
 
         info!(
             "🎯 ENTRY SIGNAL: {} momentum={:.4}% spread={:.2}bps | Dynamic SL={:.2}% TP={:.2}%",

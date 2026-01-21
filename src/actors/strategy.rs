@@ -428,27 +428,35 @@ impl StrategyEngine {
                     return;
                 }
 
-                // ✅ ANTI-FOMO: Buy Pullback Filter (only for LONG signals)
-                // Block LONG entries if price is too far above VWAP (buying the top)
-                if signal_is_bullish {
-                    if let Some(vwap_distance) = self.calculate_vwap_distance() {
-                        const MAX_DISTANCE_TO_VWAP: f64 = 0.005; // 0.5% above VWAP
+                // ✅ ANTI-FOMO: Symmetric Mean Reversion Filter
+                // Block entries if price is too far from VWAP (buying top / selling bottom)
+                if let Some(vwap_distance) = self.calculate_vwap_distance() {
+                    const MAX_DISTANCE_TO_VWAP: f64 = 0.005; // 0.5% threshold
 
-                        if vwap_distance > MAX_DISTANCE_TO_VWAP {
-                            warn!(
-                                "🚫 ANTI-FOMO REJECTED: Price too far above VWAP (+{:.2}%). Waiting for pullback.",
-                                vwap_distance * 100.0
-                            );
-                            self.pending_signal = None;
-                            self.confirmation_count = 0;
-                            return;
-                        }
-
-                        debug!(
-                            "✅ Anti-FOMO check passed: Price {:.2}% from VWAP (max +0.5%)",
+                    if signal_is_bullish && vwap_distance > MAX_DISTANCE_TO_VWAP {
+                        warn!(
+                            "🚫 ANTI-FOMO REJECTED: LONG blocked - price too far ABOVE VWAP (+{:.2}%). Waiting for pullback.",
                             vwap_distance * 100.0
                         );
+                        self.pending_signal = None;
+                        self.confirmation_count = 0;
+                        return;
                     }
+
+                    if !signal_is_bullish && vwap_distance < -MAX_DISTANCE_TO_VWAP {
+                        warn!(
+                            "🚫 ANTI-FOMO REJECTED: SHORT blocked - price too far BELOW VWAP ({:.2}%). Waiting for bounce.",
+                            vwap_distance * 100.0
+                        );
+                        self.pending_signal = None;
+                        self.confirmation_count = 0;
+                        return;
+                    }
+
+                    debug!(
+                        "✅ Anti-FOMO check passed: Price {:.2}% from VWAP (within ±0.5%)",
+                        vwap_distance * 100.0
+                    );
                 }
 
                 // ✅ IMPROVEMENT #1: Confirmation delay
@@ -712,10 +720,11 @@ impl StrategyEngine {
             OrderSide::Sell
         };
 
-        // ✅ RISK-ADJUSTED POSITION SIZING
-        // Goal: Lose same dollar amount regardless of SL size
+        // ✅ RISK-ADJUSTED POSITION SIZING (FIXED DOLLAR RISK)
+        // Goal: Lose exactly $0.30 regardless of SL size or volatility
         // Formula: Position_Size = Risk_Amount / (SL_Percent / 100)
-        const RISK_AMOUNT_USD: f64 = 10.0; // Risk $10 per trade
+        // Example: SL 1% → Position $30, SL 3% → Position $10 (both risk $0.30)
+        const RISK_AMOUNT_USD: f64 = 0.30; // Fixed risk: $0.30 per trade
 
         let sl_decimal = dynamic_sl_percent / 100.0; // Convert to decimal (e.g., 1.5% -> 0.015)
         let risk_adjusted_position_usd = RISK_AMOUNT_USD / sl_decimal;

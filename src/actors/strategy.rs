@@ -460,13 +460,24 @@ impl StrategyEngine {
         // - calculate_momentum: requires 50 ticks
         // - calculate_trend: requires 200 ticks (50 vs 200 VWAP)
         // Without 200 ticks, trend alignment check returns None and is SKIPPED!
-        if self.tick_buffer.len() < 200 {
-            debug!("📊 Buffering ticks: {}/200", self.tick_buffer.len());
+        let buffer_len = self.tick_buffer.len();
+        if buffer_len < 200 {
+            // ✅ FIX BUG #15: Show buffering progress at INFO level (every 20 ticks + milestones)
+            // User needs to see the bot is working and accumulating data
+            if buffer_len % 20 == 0 || buffer_len == 50 || buffer_len == 100 || buffer_len == 150 || buffer_len == 199 {
+                info!("📊 Buffering ticks: {}/200 ({}% ready)", buffer_len, buffer_len * 100 / 200);
+            }
             return;
+        }
+
+        // ✅ FIX BUG #15: One-time notification when ready (tick #200)
+        if buffer_len == 200 {
+            info!("✅ Buffer FULL! Bot is now ACTIVE and monitoring for entry signals.");
         }
 
         // ✅ FIXED: State machine prevents double entry, entry while closing, etc.
         if self.state != StrategyState::Idle {
+            // Keep as debug - happens frequently, no need to spam INFO logs
             debug!("⏸️  Not in Idle state ({:?}), skipping new entry signals", self.state);
             return;
         }
@@ -482,11 +493,14 @@ impl StrategyEngine {
 
         // Calculate momentum
         if let Some(momentum) = self.calculate_momentum() {
-            debug!("Momentum: {:.4}%", momentum * 100.0);
-
             // Check entry conditions
             if momentum.abs() > self.momentum_threshold {
                 let signal_is_bullish = momentum > 0.0;
+
+                // ✅ FIX BUG #15: Show analysis at INFO level when strong signal detected
+                info!("📈 Strong momentum detected: {:.2}% ({}) | Analyzing entry...",
+                      momentum * 100.0,
+                      if signal_is_bullish { "BULLISH" } else { "BEARISH" });
 
                 // ✅ PUMP PROTECTION: Global Trend Filter (24h price change)
                 // Prevents "Suicide Shorts" on parabolic pumps and "Suicide Longs" on crashes

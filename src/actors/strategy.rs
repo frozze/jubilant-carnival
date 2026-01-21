@@ -18,6 +18,7 @@ enum StrategyState {
     OrderPending,         // Order sent, waiting for confirmation
     PositionOpen,         // Position confirmed by exchange
     ClosingPosition,      // Close order sent, waiting for confirmation
+    SwitchingSymbol,      // Closing position before symbol switch
 }
 
 /// StrategyEngine - Impulse/Momentum Scalping with Smart Order Routing
@@ -49,6 +50,9 @@ pub struct StrategyEngine {
 
     /// Track entry price to detect losses on close
     entry_price: Option<Decimal>,
+
+    /// ✅ FIX: Store pending symbol change until position is closed
+    pending_symbol_change: Option<(Symbol, SymbolSpecs)>,
 }
 
 impl StrategyEngine {
@@ -72,6 +76,7 @@ impl StrategyEngine {
             state: StrategyState::Idle,
             loss_cooldown: HashMap::new(),
             entry_price: None,
+            pending_symbol_change: None,
         }
     }
 
@@ -104,10 +109,11 @@ impl StrategyEngine {
                                     self.entry_price = Some(pos.entry_price);
                                     debug!("📌 Entry price recorded: {}", pos.entry_price);
                                 }
-                            } else if self.state == StrategyState::ClosingPosition {
-                                info!("✅ Position closed, transitioning to Idle");
+                            } else if self.state == StrategyState::ClosingPosition || self.state == StrategyState::SwitchingSymbol {
+                                info!("✅ Position closed, checking for loss...");
 
                                 // 🔴 CRITICAL FIX: Check if closed with loss
+                                // Use current_symbol (OLD symbol before switch), not pending symbol
                                 if let (Some(entry), Some(ref symbol)) = (self.entry_price, &self.current_symbol) {
                                     if let Some(ref ob) = self.last_orderbook {
                                         let close_price = ob.mid_price;
@@ -138,7 +144,14 @@ impl StrategyEngine {
                                     }
                                 }
 
-                                self.state = StrategyState::Idle;
+                                // ✅ SEQUENCE FIX: Complete pending symbol change if exists
+                                if self.state == StrategyState::SwitchingSymbol {
+                                    info!("🔄 Position closed, now completing symbol switch");
+                                    self.complete_symbol_change();
+                                } else {
+                                    self.state = StrategyState::Idle;
+                                }
+
                                 self.entry_price = None; // Clear entry price
                             }
                         }
@@ -159,15 +172,28 @@ impl StrategyEngine {
                                     self.state = StrategyState::Idle;
                                     self.current_position = None;
                                 }
+                                StrategyState::SwitchingSymbol => {
+                                    // Close order filled during symbol switch - wait for PositionUpdate
+                                    debug!("Close order filled during symbol switch, waiting for PositionUpdate");
+                                }
                                 _ => {
                                     warn!("Received OrderFilled in unexpected state: {:?}", self.state);
                                 }
                             }
                         }
                         StrategyMessage::OrderFailed(error) => {
-                            warn!("❌ Order failed: {}, transitioning to Idle", error);
-                            self.state = StrategyState::Idle;
+                            warn!("❌ Order failed: {}, resetting state", error);
+
+                            // If we were switching symbols, complete the switch
+                            if self.state == StrategyState::SwitchingSymbol {
+                                info!("🔄 Close order failed during symbol switch, completing switch anyway");
+                                self.complete_symbol_change();
+                            } else {
+                                self.state = StrategyState::Idle;
+                            }
+
                             self.current_position = None;
+                            self.entry_price = None;
                         }
                     }
                 }
@@ -196,15 +222,17 @@ impl StrategyEngine {
     }
 
     async fn handle_symbol_change(&mut self, new_symbol: Symbol, specs: SymbolSpecs) {
-        info!("🔄 Symbol changed to: {} (qty_step: {}, tick_size: {})",
+        info!("🔄 Symbol change request to: {} (qty_step: {}, tick_size: {})",
               new_symbol, specs.qty_step, specs.tick_size);
 
         // Close any existing position
         if let Some(ref position) = self.current_position {
             info!("⚠️  Closing position on {} before symbol switch", position.symbol);
 
-            // ✅ FIXED: Transition to ClosingPosition state
-            self.state = StrategyState::ClosingPosition;
+            // ✅ FIXED: Store pending symbol change and transition to SwitchingSymbol state
+            // Do NOT change current_symbol yet - wait for position to close
+            self.pending_symbol_change = Some((new_symbol, specs));
+            self.state = StrategyState::SwitchingSymbol;
 
             if let Err(e) = self
                 .execution_tx
@@ -215,17 +243,33 @@ impl StrategyEngine {
                 .await
             {
                 warn!("Failed to send ClosePosition on symbol change: {}", e);
-                // Will reset to Idle below anyway
+                // Fallback: complete symbol change immediately if send failed
+                self.complete_symbol_change();
             }
+        } else {
+            // No position - can switch immediately
+            info!("✅ No position, switching to {} immediately", new_symbol);
+            self.current_symbol = Some(new_symbol);
+            self.current_position = None;
+            self.last_orderbook = None;
+            self.current_specs = Some(specs);
+            self.tick_buffer = RingBuffer::new(100);
+            self.state = StrategyState::Idle;
         }
+    }
 
-        // Reset state
-        self.current_symbol = Some(new_symbol);
-        self.current_position = None;
-        self.last_orderbook = None;
-        self.current_specs = Some(specs);
-        self.tick_buffer = RingBuffer::new(100);
-        self.state = StrategyState::Idle; // ✅ Reset state machine
+    /// Complete the pending symbol change after position is closed
+    fn complete_symbol_change(&mut self) {
+        if let Some((new_symbol, specs)) = self.pending_symbol_change.take() {
+            info!("✅ Completing symbol change to {}", new_symbol);
+
+            self.current_symbol = Some(new_symbol);
+            self.current_position = None;
+            self.last_orderbook = None;
+            self.current_specs = Some(specs);
+            self.tick_buffer = RingBuffer::new(100);
+            self.state = StrategyState::Idle;
+        }
     }
 
     async fn handle_orderbook(&mut self, snapshot: OrderBookSnapshot) {
@@ -348,6 +392,12 @@ impl StrategyEngine {
         // ✅ FIXED: State machine prevents double entry, entry while closing, etc.
         if self.state != StrategyState::Idle {
             debug!("⏸️  Not in Idle state ({:?}), skipping new entry signals", self.state);
+            return;
+        }
+
+        // ✅ SEQUENCE FIX: Don't enter if we have a pending symbol change
+        if self.pending_symbol_change.is_some() {
+            debug!("⏸️  Pending symbol change, skipping entry");
             return;
         }
 

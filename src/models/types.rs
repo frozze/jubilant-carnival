@@ -225,8 +225,24 @@ impl<T: Clone> RingBuffer<T> {
         self.buffer[idx].as_ref()
     }
 
+    /// ✅ PERFORMANCE: Optimized iterator - only checks filled slots (size), not all capacity
     pub fn iter(&self) -> impl Iterator<Item = &T> {
-        self.buffer.iter().filter_map(|x| x.as_ref())
+        // Collect indices of filled slots in chronological order
+        let capacity = self.capacity;
+        let size = self.size;
+        let head = self.head;
+
+        // Calculate start index (oldest element)
+        let start_idx = if size < capacity {
+            0 // Buffer not full yet, start from beginning
+        } else {
+            head // Buffer full, oldest element is at head position
+        };
+
+        // Create iterator that visits only filled slots in order
+        (0..size)
+            .map(move |i| (start_idx + i) % capacity)
+            .filter_map(move |idx| self.buffer.get(idx).and_then(|x| x.as_ref()))
     }
 
     pub fn len(&self) -> usize {

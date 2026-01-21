@@ -1,4 +1,5 @@
 use crate::actors::messages::{ExecutionMessage, StrategyMessage};
+use crate::alerts::AlertSender;
 use crate::config::Config;
 use crate::exchange::BybitClient;
 use crate::models::*;
@@ -11,10 +12,10 @@ use tracing::{error, info, warn};
 /// ExecutionActor - Order placement and position tracking
 pub struct ExecutionActor {
     client: BybitClient,
-    #[allow(dead_code)]
     config: Arc<Config>,
     message_rx: mpsc::Receiver<ExecutionMessage>,
     strategy_tx: mpsc::Sender<StrategyMessage>,
+    alert_sender: Option<AlertSender>,
 }
 
 impl ExecutionActor {
@@ -23,12 +24,14 @@ impl ExecutionActor {
         config: Arc<Config>,
         message_rx: mpsc::Receiver<ExecutionMessage>,
         strategy_tx: mpsc::Sender<StrategyMessage>,
+        alert_sender: Option<AlertSender>,
     ) -> Self {
         Self {
             client,
             config,
             message_rx,
             strategy_tx,
+            alert_sender,
         }
     }
 
@@ -74,6 +77,14 @@ impl ExecutionActor {
             Err(e) => {
                 let error_msg = format!("Failed to place order: {}", e);
                 error!("❌ {}", error_msg);
+
+                // Send Telegram alert
+                if let Some(ref alerter) = self.alert_sender {
+                    alerter.error(
+                        "❌ Order Failed",
+                        format!("Symbol: {}\nError: {}", symbol, e),
+                    );
+                }
 
                 // Notify strategy that order failed
                 if let Err(e) = self

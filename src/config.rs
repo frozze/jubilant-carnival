@@ -25,6 +25,10 @@ pub struct Config {
     // Risk management
     pub max_spread_bps: f64,
     pub stale_data_threshold_ms: i64,
+
+    // Telegram alerts (optional)
+    pub telegram_bot_token: Option<String>,
+    pub telegram_chat_id: Option<String>,
 }
 
 impl Config {
@@ -79,7 +83,16 @@ impl Config {
                 .unwrap_or_else(|_| "500".to_string())
                 .parse()
                 .unwrap_or(500),
+
+            // Telegram alerts (optional)
+            telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN").ok(),
+            telegram_chat_id: env::var("TELEGRAM_CHAT_ID").ok(),
         })
+    }
+
+    /// Check if Telegram alerts are configured
+    pub fn has_telegram(&self) -> bool {
+        self.telegram_bot_token.is_some() && self.telegram_chat_id.is_some()
     }
 
     /// Get REST API URL

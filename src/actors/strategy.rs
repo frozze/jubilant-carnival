@@ -1,4 +1,5 @@
 use crate::actors::messages::{ExecutionMessage, StrategyMessage};
+use crate::alerts::AlertSender;
 use crate::config::Config;
 use crate::exchange::SymbolSpecs;
 use crate::models::*;
@@ -23,6 +24,7 @@ pub struct StrategyEngine {
     config: Arc<Config>,
     message_rx: mpsc::Receiver<StrategyMessage>,
     execution_tx: mpsc::Sender<ExecutionMessage>,
+    alert_sender: Option<AlertSender>,
 
     // State
     current_symbol: Option<Symbol>,
@@ -45,11 +47,13 @@ impl StrategyEngine {
         config: Arc<Config>,
         message_rx: mpsc::Receiver<StrategyMessage>,
         execution_tx: mpsc::Sender<ExecutionMessage>,
+        alert_sender: Option<AlertSender>,
     ) -> Self {
         Self {
             config,
             message_rx,
             execution_tx,
+            alert_sender,
             current_symbol: None,
             current_position: None,
             last_orderbook: None,
@@ -190,14 +194,28 @@ impl StrategyEngine {
         if let Some(ref mut position) = self.current_position {
             position.current_price = snapshot.mid_price;
 
-            // Check stop loss
-            if position.should_stop_loss() {
+            // Calculate PnL percentage
+            let pnl_pct = position.pnl_percent();
+
+            // ✅ CRITICAL FIX: Check stop loss using PnL%
+            if pnl_pct <= -self.config.stop_loss_percent {
                 warn!(
                     "🛑 STOP LOSS triggered for {} at {} (PnL: {:.2}%)",
                     position.symbol,
                     position.current_price,
-                    position.pnl_percent()
+                    pnl_pct
                 );
+
+                // Send Telegram alert
+                if let Some(ref alerter) = self.alert_sender {
+                    alerter.warning(
+                        "🛑 STOP LOSS",
+                        format!(
+                            "Symbol: {}\nPrice: {}\nPnL: {:.2}%\nClosing position...",
+                            position.symbol, position.current_price, pnl_pct
+                        ),
+                    );
+                }
 
                 // ✅ FIXED: Transition to ClosingPosition state
                 self.state = StrategyState::ClosingPosition;
@@ -218,12 +236,22 @@ impl StrategyEngine {
             }
 
             // Check take profit
-            let pnl_pct = position.pnl_percent();
             if pnl_pct >= self.config.take_profit_percent {
                 info!(
                     "💰 TAKE PROFIT hit for {} (PnL: {:.2}%)",
                     position.symbol, pnl_pct
                 );
+
+                // Send Telegram alert
+                if let Some(ref alerter) = self.alert_sender {
+                    alerter.success(
+                        "💰 TAKE PROFIT",
+                        format!(
+                            "Symbol: {}\nPrice: {}\nPnL: {:.2}%\nClosing position...",
+                            position.symbol, position.current_price, pnl_pct
+                        ),
+                    );
+                }
 
                 // ✅ FIXED: Transition to ClosingPosition state
                 self.state = StrategyState::ClosingPosition;

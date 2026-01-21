@@ -1,5 +1,6 @@
 use anyhow::Result;
 use bybit_scalper_bot::actors::*;
+use bybit_scalper_bot::alerts::{Alert, AlertSender, TelegramAlerter};
 use bybit_scalper_bot::config::Config;
 use bybit_scalper_bot::exchange::BybitClient;
 use std::sync::Arc;
@@ -31,6 +32,27 @@ async fn main() -> Result<()> {
     info!("   - Max Position: ${}", config.max_position_size_usd);
     info!("   - Stop Loss: {}%", config.stop_loss_percent);
     info!("   - Scan Interval: {}s", config.scan_interval_secs);
+
+    // Setup Telegram alerts (optional)
+    let alert_sender = if config.has_telegram() {
+        info!("📨 Telegram alerts ENABLED");
+        let (alert_tx, alert_rx) = mpsc::channel::<Alert>(100);
+        let alerter = TelegramAlerter::new(
+            config.telegram_bot_token.clone().unwrap(),
+            config.telegram_chat_id.clone().unwrap(),
+            alert_rx,
+        );
+
+        // Spawn alerter task
+        tokio::spawn(async move {
+            alerter.run().await;
+        });
+
+        Some(AlertSender::new(alert_tx))
+    } else {
+        info!("📨 Telegram alerts DISABLED (no credentials)");
+        None
+    };
 
     // Create Bybit client
     let client = BybitClient::new(
@@ -72,6 +94,7 @@ async fn main() -> Result<()> {
         config.clone(),
         strategy_rx,
         execution_tx.clone(),
+        alert_sender.clone(),
     );
 
     // Initialize ExecutionActor
@@ -80,6 +103,7 @@ async fn main() -> Result<()> {
         config.clone(),
         execution_rx,
         strategy_tx.clone(),
+        alert_sender.clone(),
     );
 
     info!("✅ All actors initialized");

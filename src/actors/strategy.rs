@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// ✅ FIXED: Proper state machine for order lifecycle
@@ -42,6 +42,18 @@ pub struct StrategyEngine {
 
     // ✅ FIX BUG #1: Store pending symbol change until position is closed
     pending_symbol_change: Option<(Symbol, SymbolSpecs)>,
+
+    // ✅ IMPROVEMENT #1: Confirmation delay - wait for signal confirmation
+    /// Stores pending signal direction: Some(true) = bullish, Some(false) = bearish
+    pending_signal: Option<bool>,
+    /// How many consecutive ticks confirmed the signal direction
+    confirmation_count: u8,
+
+    // ✅ IMPROVEMENT #3: Trade cooldown - prevent revenge trading
+    /// When the last trade was closed
+    last_trade_time: Option<Instant>,
+    /// Cooldown duration in seconds (configurable)
+    trade_cooldown_secs: u64,
 }
 
 impl StrategyEngine {
@@ -61,7 +73,13 @@ impl StrategyEngine {
             tick_buffer: RingBuffer::new(100),
             momentum_threshold: 0.001, // 0.1% momentum threshold
             state: StrategyState::Idle,
-            pending_symbol_change: None, // ✅ FIX BUG #1
+            pending_symbol_change: None,
+            // ✅ IMPROVEMENT #1: Confirmation delay
+            pending_signal: None,
+            confirmation_count: 0,
+            // ✅ IMPROVEMENT #3: Trade cooldown (30 seconds)
+            last_trade_time: None,
+            trade_cooldown_secs: 30,
         }
     }
 
@@ -90,10 +108,14 @@ impl StrategyEngine {
                                 self.state = StrategyState::PositionOpen;
                             } else if self.state == StrategyState::ClosingPosition {
                                 info!("✅ Position closed, transitioning to Idle");
+                                // ✅ IMPROVEMENT #3: Start trade cooldown
+                                self.last_trade_time = Some(Instant::now());
                                 self.state = StrategyState::Idle;
                             } else if self.state == StrategyState::SwitchingSymbol {
                                 // ✅ FIX BUG #1: Now complete the pending symbol change
                                 info!("✅ Position closed during symbol switch, completing switch...");
+                                // ✅ IMPROVEMENT #3: Start trade cooldown
+                                self.last_trade_time = Some(Instant::now());
                                 if let Some((new_symbol, specs)) = self.pending_symbol_change.take() {
                                     self.complete_symbol_switch(new_symbol, specs);
                                 } else {
@@ -300,27 +322,124 @@ impl StrategyEngine {
             return;
         }
 
+        // ✅ IMPROVEMENT #3: Check trade cooldown
+        if let Some(last_trade) = self.last_trade_time {
+            let elapsed = last_trade.elapsed().as_secs();
+            if elapsed < self.trade_cooldown_secs {
+                debug!("⏳ Trade cooldown: {}s remaining", self.trade_cooldown_secs - elapsed);
+                return;
+            }
+        }
+
         // Calculate momentum
         if let Some(momentum) = self.calculate_momentum() {
             debug!("Momentum: {:.4}%", momentum * 100.0);
 
             // Check entry conditions
             if momentum.abs() > self.momentum_threshold {
-                if let Some(ref orderbook) = self.last_orderbook {
-                    // Check spread is reasonable
-                    if orderbook.spread_bps > self.config.max_spread_bps {
-                        debug!(
-                            "Spread too wide: {:.2} bps (max: {:.2})",
-                            orderbook.spread_bps, self.config.max_spread_bps
+                // ✅ IMPROVEMENT #2: Trend alignment - check if signal aligns with trend
+                let signal_is_bullish = momentum > 0.0;
+                
+                if let Some(trend_bullish) = self.calculate_trend() {
+                    if signal_is_bullish != trend_bullish {
+                        debug!("📉 Signal rejected: {} signal vs {} trend",
+                            if signal_is_bullish { "BULLISH" } else { "BEARISH" },
+                            if trend_bullish { "BULLISH" } else { "BEARISH" }
                         );
+                        // Reset confirmation on trend mismatch
+                        self.pending_signal = None;
+                        self.confirmation_count = 0;
                         return;
                     }
+                }
 
-                    let orderbook_clone = orderbook.clone();
-                    self.execute_entry(momentum, &orderbook_clone).await;
+                // ✅ IMPROVEMENT #1: Confirmation delay
+                if let Some(pending_bullish) = self.pending_signal {
+                    // Check if current signal matches pending
+                    if pending_bullish == signal_is_bullish {
+                        self.confirmation_count += 1;
+                        debug!("🔄 Signal confirmation: {}/3", self.confirmation_count);
+                        
+                        // Need 3 consecutive confirmations
+                        if self.confirmation_count >= 3 {
+                            if let Some(ref orderbook) = self.last_orderbook {
+                                // Check spread is reasonable
+                                if orderbook.spread_bps > self.config.max_spread_bps {
+                                    debug!(
+                                        "Spread too wide: {:.2} bps (max: {:.2})",
+                                        orderbook.spread_bps, self.config.max_spread_bps
+                                    );
+                                    return;
+                                }
+
+                                // ✅ Signal confirmed - execute entry!
+                                info!("✅ Signal CONFIRMED after {} ticks", self.confirmation_count);
+                                self.pending_signal = None;
+                                self.confirmation_count = 0;
+                                
+                                let orderbook_clone = orderbook.clone();
+                                self.execute_entry(momentum, &orderbook_clone).await;
+                            }
+                        }
+                    } else {
+                        // Direction changed - reset
+                        debug!("🔄 Signal direction changed, resetting confirmation");
+                        self.pending_signal = Some(signal_is_bullish);
+                        self.confirmation_count = 1;
+                    }
+                } else {
+                    // First time seeing this signal - start confirmation
+                    debug!("🆕 New {} signal, starting confirmation...", 
+                        if signal_is_bullish { "BULLISH" } else { "BEARISH" }
+                    );
+                    self.pending_signal = Some(signal_is_bullish);
+                    self.confirmation_count = 1;
+                }
+            } else {
+                // Momentum below threshold - reset pending signal
+                if self.pending_signal.is_some() {
+                    debug!("📉 Momentum dropped below threshold, resetting confirmation");
+                    self.pending_signal = None;
+                    self.confirmation_count = 0;
                 }
             }
         }
+    }
+
+    /// ✅ IMPROVEMENT #2: Calculate trend using short vs long VWAP
+    fn calculate_trend(&self) -> Option<bool> {
+        let ticks: Vec<&TradeTick> = self.tick_buffer.iter().collect();
+        
+        // Need at least 50 ticks for comparison
+        if ticks.len() < 50 {
+            return None;
+        }
+
+        // Short VWAP (last 20 ticks)
+        let mut short_value = Decimal::ZERO;
+        let mut short_volume = Decimal::ZERO;
+        for tick in ticks.iter().rev().take(20) {
+            short_value += tick.price * tick.size;
+            short_volume += tick.size;
+        }
+
+        // Long VWAP (last 50 ticks)  
+        let mut long_value = Decimal::ZERO;
+        let mut long_volume = Decimal::ZERO;
+        for tick in ticks.iter().rev().take(50) {
+            long_value += tick.price * tick.size;
+            long_volume += tick.size;
+        }
+
+        if short_volume == Decimal::ZERO || long_volume == Decimal::ZERO {
+            return None;
+        }
+
+        let short_vwap = short_value / short_volume;
+        let long_vwap = long_value / long_volume;
+
+        // Bullish trend = short VWAP above long VWAP
+        Some(short_vwap > long_vwap)
     }
 
     fn calculate_momentum(&self) -> Option<f64> {

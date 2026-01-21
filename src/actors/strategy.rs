@@ -491,6 +491,25 @@ impl StrategyEngine {
             }
         }
 
+        // ✅ FIX BUG #15: Periodic status report (every 50 ticks after buffer full)
+        // Show user what's happening even if no strong signals
+        if self.tick_counter % 50 == 0 && self.tick_counter > 200 {
+            if let Some(momentum) = self.calculate_momentum() {
+                let trend_str = match self.calculate_trend() {
+                    Some(true) => "BULLISH",
+                    Some(false) => "BEARISH",
+                    None => "UNKNOWN",
+                };
+                let vwap_dist = self.calculate_vwap_distance().unwrap_or(0.0);
+
+                info!("📊 Market Analysis | Momentum: {:.2}% | Trend: {} | VWAP Distance: {:.2}% | Threshold: {:.2}%",
+                      momentum * 100.0,
+                      trend_str,
+                      vwap_dist * 100.0,
+                      self.momentum_threshold * 100.0);
+            }
+        }
+
         // Calculate momentum
         if let Some(momentum) = self.calculate_momentum() {
             // Check entry conditions

@@ -3,9 +3,10 @@ use crate::config::Config;
 use crate::exchange::{BybitClient, SpecsCache, SymbolSpecs};
 use crate::models::Symbol;
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, Instant};
 use tracing::{error, info, warn};
 
 /// The "Predator" Scanner - hunts for high-volatility coins
@@ -17,6 +18,9 @@ pub struct ScannerActor {
     specs_cache: SpecsCache,
     current_symbol: Option<Symbol>,
     current_score: f64,
+    /// Blacklist: symbols to avoid for a period after losses
+    /// Maps symbol name to blacklist expiry time
+    blacklist: HashMap<String, Instant>,
 }
 
 impl ScannerActor {
@@ -34,6 +38,7 @@ impl ScannerActor {
             specs_cache: SpecsCache::new(),
             current_symbol: None,
             current_score: 0.0,
+            blacklist: HashMap::new(),
         }
     }
 
@@ -60,6 +65,15 @@ impl ScannerActor {
 
     async fn scan_and_select(&mut self) -> Result<()> {
         info!("🎯 Starting market scan...");
+
+        // Clean up expired blacklist entries
+        let now = Instant::now();
+        self.blacklist.retain(|_, expiry| *expiry > now);
+
+        if !self.blacklist.is_empty() {
+            info!("⚫ Blacklisted symbols (temporary): {:?}",
+                  self.blacklist.keys().collect::<Vec<_>>());
+        }
 
         // Fetch all tickers
         let tickers = self.client.get_tickers("linear").await?;
@@ -92,6 +106,11 @@ impl ScannerActor {
                     return None;
                 }
 
+                // ⚫ CRITICAL FIX: Skip blacklisted symbols
+                if self.blacklist.contains_key(&symbol) {
+                    return None;
+                }
+
                 // Parse turnover and price change
                 let turnover_24h = ticker.turnover_24h.parse::<f64>().ok()?;
                 let price_change_24h = ticker.price_24h_pcnt.parse::<f64>().ok()?;
@@ -101,7 +120,18 @@ impl ScannerActor {
                     return None;
                 }
 
-                // ✅ PURE FORMULA: Turnover * |PriceChange| (NO BIAS)
+                // 🎯 SMART FILTER: Allow pumps + moderate dumps (for Short opportunities)
+                // But filter extreme dumps (< -3%) - bad liquidity, wide spreads
+                // Rationale:
+                // - Pumps (+): good for Long momentum scalping
+                // - Small dumps (-1% to -3%): good for Short on corrections
+                // - Extreme dumps (< -3%): avoid - low liquidity, panic selling
+                if price_change_24h < -0.03 {
+                    return None;
+                }
+
+                // ✅ Score: Turnover × |PriceChange|
+                // Use absolute value so both pumps and dumps score high
                 let score = turnover_24h * price_change_24h.abs();
 
                 Some(ScoredCoin {

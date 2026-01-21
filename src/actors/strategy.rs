@@ -5,9 +5,10 @@ use crate::exchange::SymbolSpecs;
 use crate::models::*;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// ✅ FIXED: Proper state machine for order lifecycle
@@ -40,6 +41,14 @@ pub struct StrategyEngine {
 
     // ✅ FIXED: Proper state machine replaces simple boolean
     state: StrategyState,
+
+    // 🔴 CRITICAL FIX: Cooldown after loss to prevent re-entering bad symbols
+    /// Maps symbol name to cooldown expiry time
+    /// After closing with loss, symbol is blocked for 10 minutes
+    loss_cooldown: HashMap<String, Instant>,
+
+    /// Track entry price to detect losses on close
+    entry_price: Option<Decimal>,
 }
 
 impl StrategyEngine {
@@ -61,6 +70,8 @@ impl StrategyEngine {
             tick_buffer: RingBuffer::new(100),
             momentum_threshold: 0.001, // 0.1% momentum threshold
             state: StrategyState::Idle,
+            loss_cooldown: HashMap::new(),
+            entry_price: None,
         }
     }
 
@@ -84,12 +95,49 @@ impl StrategyEngine {
                         StrategyMessage::PositionUpdate(position) => {
                             self.current_position = position.clone();
                             // ✅ FIXED: Update state machine based on position
-                            if position.is_some() {
+                            if let Some(ref pos) = position {
                                 info!("📍 Position confirmed, transitioning to PositionOpen");
                                 self.state = StrategyState::PositionOpen;
+
+                                // 🔴 CRITICAL FIX: Record entry price for loss detection
+                                if self.entry_price.is_none() {
+                                    self.entry_price = Some(pos.entry_price);
+                                    debug!("📌 Entry price recorded: {}", pos.entry_price);
+                                }
                             } else if self.state == StrategyState::ClosingPosition {
                                 info!("✅ Position closed, transitioning to Idle");
+
+                                // 🔴 CRITICAL FIX: Check if closed with loss
+                                if let (Some(entry), Some(ref symbol)) = (self.entry_price, &self.current_symbol) {
+                                    if let Some(ref ob) = self.last_orderbook {
+                                        let close_price = ob.mid_price;
+                                        let pnl_decimal = (close_price - entry) / entry;
+                                        let pnl_pct = pnl_decimal.to_f64().unwrap_or(0.0) * 100.0;
+
+                                        if pnl_pct < 0.0 {
+                                            warn!("📉 Position closed with LOSS: {:.2}%, adding {} to cooldown (10 min)",
+                                                  pnl_pct, symbol);
+
+                                            // Add to cooldown for 10 minutes
+                                            let cooldown_until = Instant::now() + Duration::from_secs(600);
+                                            self.loss_cooldown.insert(symbol.0.clone(), cooldown_until);
+
+                                            // Send Telegram alert
+                                            if let Some(ref alerter) = self.alert_sender {
+                                                alerter.warning(
+                                                    "📉 Loss Cooldown",
+                                                    format!(
+                                                        "Symbol: {}\nClosed with: {:.2}%\nCooldown: 10 minutes\nWill not re-enter this symbol for safety.",
+                                                        symbol, pnl_pct
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+
                                 self.state = StrategyState::Idle;
+                                self.entry_price = None; // Clear entry price
                             }
                         }
                         StrategyMessage::SymbolChanged { symbol: new_symbol, specs } => {
@@ -299,6 +347,23 @@ impl StrategyEngine {
         if self.state != StrategyState::Idle {
             debug!("⏸️  Not in Idle state ({:?}), skipping new entry signals", self.state);
             return;
+        }
+
+        // 🔴 CRITICAL FIX: Check loss cooldown before entry
+        // Clean expired cooldowns first
+        let now = Instant::now();
+        self.loss_cooldown.retain(|_, expiry| *expiry > now);
+
+        // Check if current symbol is in cooldown
+        if let Some(ref symbol) = self.current_symbol {
+            if let Some(expiry) = self.loss_cooldown.get(&symbol.0) {
+                let remaining = expiry.saturating_duration_since(now);
+                debug!(
+                    "⏸️  Symbol {} in loss cooldown, {:?} remaining",
+                    symbol, remaining
+                );
+                return;
+            }
         }
 
         // Calculate momentum

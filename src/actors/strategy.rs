@@ -405,18 +405,27 @@ impl StrategyEngine {
                 );
 
                 // ✅ IMPROVEMENT #2: Trend alignment - check if signal aligns with trend
-                
-                if let Some(trend_bullish) = self.calculate_trend() {
-                    if signal_is_bullish != trend_bullish {
-                        debug!("📉 Signal rejected: {} signal vs {} trend",
-                            if signal_is_bullish { "BULLISH" } else { "BEARISH" },
-                            if trend_bullish { "BULLISH" } else { "BEARISH" }
-                        );
-                        // Reset confirmation on trend mismatch
+                // ✅ CRITICAL FIX: Make trend check MANDATORY (block if None)
+                let trend_bullish = match self.calculate_trend() {
+                    Some(trend) => trend,
+                    None => {
+                        // Should not happen (we have 200 ticks), but if zero volume - block entry
+                        warn!("⚠️ Cannot calculate trend (zero volume?), blocking entry for safety");
                         self.pending_signal = None;
                         self.confirmation_count = 0;
                         return;
                     }
+                };
+
+                if signal_is_bullish != trend_bullish {
+                    debug!("📉 Signal rejected: {} signal vs {} trend",
+                        if signal_is_bullish { "BULLISH" } else { "BEARISH" },
+                        if trend_bullish { "BULLISH" } else { "BEARISH" }
+                    );
+                    // Reset confirmation on trend mismatch
+                    self.pending_signal = None;
+                    self.confirmation_count = 0;
+                    return;
                 }
 
                 // ✅ IMPROVEMENT #1: Confirmation delay

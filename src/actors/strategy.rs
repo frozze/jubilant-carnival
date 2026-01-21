@@ -409,14 +409,25 @@ impl StrategyEngine {
         // ✅ FLASH CRASH PROTECTION: Detect extreme price movements
         // If we have an open position and price moves >5% in 1 second, emergency exit
         if let Some(ref mut position) = self.current_position {
-            // ✅ FIX: Update current_price from latest trade tick BEFORE checking PnL
-            // CRITICAL: position.current_price is updated in handle_orderbook(),
-            // but flash crash check happens in handle_trade() → stale price!
-            if let Some(last_tick) = self.tick_buffer.last() {
-                position.current_price = last_tick.price;
-            }
+            // ✅ FIX RACE CONDITION: Use last_tick price ONLY for flash crash check,
+            // don't update position.current_price here (it's authoritative from orderbook)
+            // Calculate PnL using latest tick price for flash crash detection
+            let last_price = if let Some(last_tick) = self.tick_buffer.last() {
+                last_tick.price
+            } else {
+                position.current_price  // Fallback to current price
+            };
 
-            let pnl_pct = position.pnl_percent();
+            // Temporarily calculate PnL with latest tick price (don't modify position)
+            let pnl_pct = if position.entry_price > Decimal::ZERO {
+                let pnl_ratio = match position.side {
+                    PositionSide::Long => (last_price - position.entry_price) / position.entry_price,
+                    PositionSide::Short => (position.entry_price - last_price) / position.entry_price,
+                };
+                (pnl_ratio * Decimal::from(100)).to_f64().unwrap_or(0.0)
+            } else {
+                0.0
+            };
 
             // Emergency exit on flash crash (>5% adverse move)
             const FLASH_CRASH_THRESHOLD: f64 = -5.0; // -5% sudden loss
@@ -600,10 +611,14 @@ impl StrategyEngine {
                             if let Some(ref orderbook) = self.last_orderbook {
                                 // Check spread is reasonable
                                 if orderbook.spread_bps > self.config.max_spread_bps {
-                                    debug!(
-                                        "Spread too wide: {:.2} bps (max: {:.2})",
+                                    warn!(
+                                        "⚠️  Entry blocked: Spread too wide {:.2} bps (max: {:.2}). Resetting confirmation.",
                                         orderbook.spread_bps, self.config.max_spread_bps
                                     );
+                                    // ✅ FIX: Reset confirmation state when spread too wide
+                                    // CRITICAL: Market conditions changed, signal may be invalid
+                                    self.pending_signal = None;
+                                    self.confirmation_count = 0;
                                     return;
                                 }
 

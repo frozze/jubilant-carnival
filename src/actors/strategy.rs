@@ -138,6 +138,8 @@ impl StrategyEngine {
                                 StrategyState::ClosingPosition => {
                                     // Close order filled
                                     info!("Close order filled, transitioning to Idle");
+                                    // ✅ Start cooldown timer
+                                    self.last_trade_time = Some(Instant::now());
                                     self.state = StrategyState::Idle;
                                     self.current_position = None;
                                 }
@@ -220,6 +222,9 @@ impl StrategyEngine {
         self.current_specs = Some(specs);
         self.tick_buffer = RingBuffer::new(100);
         self.pending_symbol_change = None;
+        // ✅ Reset confirmation state for new symbol
+        self.pending_signal = None;
+        self.confirmation_count = 0;
         self.state = StrategyState::Idle;
     }
 

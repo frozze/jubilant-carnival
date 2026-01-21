@@ -31,17 +31,21 @@ pub struct StrategyEngine {
     last_orderbook: Option<OrderBookSnapshot>,
     current_specs: Option<SymbolSpecs>,
 
-    // Tick buffer for momentum calculation
+    // Tick buffer for momentum calculation (expanded for better trend detection)
     tick_buffer: RingBuffer<TradeTick>,
 
     // Entry conditions
     momentum_threshold: f64,
 
+    // ✅ PUMP PROTECTION: 24h price change for global trend filter
+    /// Stores 24h price change percentage (e.g., 0.25 = +25%, -0.15 = -15%)
+    price_change_24h: Option<f64>,
+
     // ✅ FIXED: Proper state machine replaces simple boolean
     state: StrategyState,
 
     // ✅ FIX BUG #1: Store pending symbol change until position is closed
-    pending_symbol_change: Option<(Symbol, SymbolSpecs)>,
+    pending_symbol_change: Option<(Symbol, SymbolSpecs, f64)>, // (symbol, specs, price_change_24h)
 
     // ✅ IMPROVEMENT #1: Confirmation delay - wait for signal confirmation
     /// Stores pending signal direction: Some(true) = bullish, Some(false) = bearish
@@ -70,10 +74,11 @@ impl StrategyEngine {
             current_position: None,
             last_orderbook: None,
             current_specs: None,
-            tick_buffer: RingBuffer::new(100),
-            momentum_threshold: 0.001, // 0.1% momentum threshold
+            tick_buffer: RingBuffer::new(300), // ✅ EXPANDED: 300 ticks for better trend detection
+            momentum_threshold: 0.002, // ✅ STRICTER: 0.2% momentum threshold (was 0.1%)
             state: StrategyState::Idle,
             pending_symbol_change: None,
+            price_change_24h: None, // ✅ PUMP PROTECTION: Will be set on symbol change
             // ✅ IMPROVEMENT #1: Confirmation delay
             pending_signal: None,
             confirmation_count: 0,
@@ -116,16 +121,16 @@ impl StrategyEngine {
                                 info!("✅ Position closed during symbol switch, completing switch...");
                                 // ✅ IMPROVEMENT #3: Start trade cooldown
                                 self.last_trade_time = Some(Instant::now());
-                                if let Some((new_symbol, specs)) = self.pending_symbol_change.take() {
-                                    self.complete_symbol_switch(new_symbol, specs);
+                                if let Some((new_symbol, specs, price_change_24h)) = self.pending_symbol_change.take() {
+                                    self.complete_symbol_switch(new_symbol, specs, price_change_24h);
                                 } else {
                                     warn!("SwitchingSymbol state but no pending change!");
                                     self.state = StrategyState::Idle;
                                 }
                             }
                         }
-                        StrategyMessage::SymbolChanged { symbol: new_symbol, specs } => {
-                            self.handle_symbol_change(new_symbol, specs).await;
+                        StrategyMessage::SymbolChanged { symbol: new_symbol, specs, price_change_24h } => {
+                            self.handle_symbol_change(new_symbol, specs, price_change_24h).await;
                         }
                         // ✅ CRITICAL: Feedback from execution with state transitions
                         StrategyMessage::OrderFilled(symbol) => {
@@ -182,16 +187,16 @@ impl StrategyEngine {
         }
     }
 
-    async fn handle_symbol_change(&mut self, new_symbol: Symbol, specs: SymbolSpecs) {
-        info!("🔄 Symbol change requested: {} (qty_step: {}, tick_size: {})",
-              new_symbol, specs.qty_step, specs.tick_size);
+    async fn handle_symbol_change(&mut self, new_symbol: Symbol, specs: SymbolSpecs, price_change_24h: f64) {
+        info!("🔄 Symbol change requested: {} (qty_step: {}, tick_size: {}, 24h: {:.2}%)",
+              new_symbol, specs.qty_step, specs.tick_size, price_change_24h * 100.0);
 
         // ✅ FIX BUG #1: If we have a position, close it FIRST and defer the switch
         if let Some(ref position) = self.current_position {
             info!("⚠️  Closing position on {} before symbol switch", position.symbol);
 
             // Store pending symbol change - will be applied after close confirmation
-            self.pending_symbol_change = Some((new_symbol, specs));
+            self.pending_symbol_change = Some((new_symbol, specs, price_change_24h));
             self.state = StrategyState::SwitchingSymbol;
 
             if let Err(e) = self
@@ -204,8 +209,8 @@ impl StrategyEngine {
             {
                 warn!("Failed to send ClosePosition on symbol change: {}", e);
                 // Fallback: complete switch anyway to avoid getting stuck
-                if let Some((sym, sp)) = self.pending_symbol_change.take() {
-                    self.complete_symbol_switch(sym, sp);
+                if let Some((sym, sp, pc)) = self.pending_symbol_change.take() {
+                    self.complete_symbol_switch(sym, sp, pc);
                 }
             }
             // DON'T switch yet - wait for PositionUpdate(None)
@@ -213,17 +218,18 @@ impl StrategyEngine {
         }
 
         // No position - switch immediately
-        self.complete_symbol_switch(new_symbol, specs);
+        self.complete_symbol_switch(new_symbol, specs, price_change_24h);
     }
 
     /// Complete the symbol switch after position is closed
-    fn complete_symbol_switch(&mut self, new_symbol: Symbol, specs: SymbolSpecs) {
-        info!("✅ Completing symbol switch to: {}", new_symbol);
+    fn complete_symbol_switch(&mut self, new_symbol: Symbol, specs: SymbolSpecs, price_change_24h: f64) {
+        info!("✅ Completing symbol switch to: {} (24h: {:.2}%)", new_symbol, price_change_24h * 100.0);
         self.current_symbol = Some(new_symbol);
         self.current_position = None;
         self.last_orderbook = None;
         self.current_specs = Some(specs);
-        self.tick_buffer = RingBuffer::new(100);
+        self.tick_buffer = RingBuffer::new(300); // ✅ EXPANDED buffer
+        self.price_change_24h = Some(price_change_24h); // ✅ Store 24h change for trend protection
         self.pending_symbol_change = None;
         // ✅ Reset confirmation state for new symbol
         self.pending_signal = None;
@@ -316,6 +322,12 @@ impl StrategyEngine {
             }
         }
 
+        // ✅ PUMP PROTECTION: Check blacklist
+        if self.config.blacklist_symbols.contains(&tick.symbol.0.to_uppercase()) {
+            debug!("⛔ Symbol {} is blacklisted, ignoring tick", tick.symbol);
+            return;
+        }
+
         // Add to buffer
         self.tick_buffer.push(tick.clone());
 
@@ -345,8 +357,41 @@ impl StrategyEngine {
 
             // Check entry conditions
             if momentum.abs() > self.momentum_threshold {
-                // ✅ IMPROVEMENT #2: Trend alignment - check if signal aligns with trend
                 let signal_is_bullish = momentum > 0.0;
+
+                // ✅ PUMP PROTECTION: Global Trend Filter (24h price change)
+                // Prevents "Suicide Shorts" on parabolic pumps and "Suicide Longs" on crashes
+                if let Some(price_change) = self.price_change_24h {
+                    const PUMP_THRESHOLD: f64 = 0.15; // 15% threshold
+
+                    if price_change > PUMP_THRESHOLD && !signal_is_bullish {
+                        warn!(
+                            "🚫 REJECTED: Attempted SHORT on PUMP coin (+{:.1}% 24h). Only LONG allowed.",
+                            price_change * 100.0
+                        );
+                        self.pending_signal = None;
+                        self.confirmation_count = 0;
+                        return;
+                    }
+
+                    if price_change < -PUMP_THRESHOLD && signal_is_bullish {
+                        warn!(
+                            "🚫 REJECTED: Attempted LONG on DUMP coin ({:.1}% 24h). Only SHORT allowed.",
+                            price_change * 100.0
+                        );
+                        self.pending_signal = None;
+                        self.confirmation_count = 0;
+                        return;
+                    }
+
+                    debug!(
+                        "✅ Global trend check passed: {} signal on {:.1}% 24h",
+                        if signal_is_bullish { "LONG" } else { "SHORT" },
+                        price_change * 100.0
+                    );
+                }
+
+                // ✅ IMPROVEMENT #2: Trend alignment - check if signal aligns with trend
                 
                 if let Some(trend_bullish) = self.calculate_trend() {
                     if signal_is_bullish != trend_bullish {
@@ -366,10 +411,10 @@ impl StrategyEngine {
                     // Check if current signal matches pending
                     if pending_bullish == signal_is_bullish {
                         self.confirmation_count += 1;
-                        debug!("🔄 Signal confirmation: {}/3", self.confirmation_count);
-                        
-                        // Need 3 consecutive confirmations
-                        if self.confirmation_count >= 3 {
+                        debug!("🔄 Signal confirmation: {}/12", self.confirmation_count);
+
+                        // ✅ STRICTER: Need 12 consecutive confirmations (was 3)
+                        if self.confirmation_count >= 12 {
                             if let Some(ref orderbook) = self.last_orderbook {
                                 // Check spread is reasonable
                                 if orderbook.spread_bps > self.config.max_spread_bps {
@@ -414,27 +459,28 @@ impl StrategyEngine {
         }
     }
 
-    /// ✅ IMPROVEMENT #2: Calculate trend using short vs long VWAP
+    /// ✅ PUMP PROTECTION: Calculate trend using short vs long VWAP
+    /// Uses 50-tick vs 200-tick window to avoid false reversals on pump coins
     fn calculate_trend(&self) -> Option<bool> {
         let ticks: Vec<&TradeTick> = self.tick_buffer.iter().collect();
-        
-        // Need at least 50 ticks for comparison
-        if ticks.len() < 50 {
+
+        // ✅ EXPANDED: Need at least 200 ticks for long VWAP (was 50)
+        if ticks.len() < 200 {
             return None;
         }
 
-        // Short VWAP (last 20 ticks)
+        // Short VWAP (last 50 ticks) - was 20
         let mut short_value = Decimal::ZERO;
         let mut short_volume = Decimal::ZERO;
-        for tick in ticks.iter().rev().take(20) {
+        for tick in ticks.iter().rev().take(50) {
             short_value += tick.price * tick.size;
             short_volume += tick.size;
         }
 
-        // Long VWAP (last 50 ticks)  
+        // ✅ EXPANDED: Long VWAP (last 200 ticks) - was 50
         let mut long_value = Decimal::ZERO;
         let mut long_volume = Decimal::ZERO;
-        for tick in ticks.iter().rev().take(50) {
+        for tick in ticks.iter().rev().take(200) {
             long_value += tick.price * tick.size;
             long_volume += tick.size;
         }
@@ -447,6 +493,7 @@ impl StrategyEngine {
         let long_vwap = long_value / long_volume;
 
         // Bullish trend = short VWAP above long VWAP
+        // This requires a sustained move to flip, preventing false signals on pump coins
         Some(short_vwap > long_vwap)
     }
 

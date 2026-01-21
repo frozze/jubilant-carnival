@@ -25,8 +25,12 @@ pub enum StrategyMessage {
     Trade(TradeTick),
     /// Position update from execution
     PositionUpdate(Option<Position>),
-    /// Symbol switched with new specs
-    SymbolChanged { symbol: Symbol, specs: SymbolSpecs },
+    /// Symbol switched with new specs and 24h price change
+    SymbolChanged {
+        symbol: Symbol,
+        specs: SymbolSpecs,
+        price_change_24h: f64, // Daily price change percentage (e.g., 0.25 = +25%)
+    },
 
     // ✅ CRITICAL: Feedback from execution to prevent order spam
     /// Order successfully placed and filled

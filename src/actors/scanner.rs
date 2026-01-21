@@ -191,9 +191,10 @@ impl ScannerActor {
                 // Send specs to StrategyEngine
                 if let Err(e) = self
                     .strategy_tx
-                    .send(StrategyMessage::SymbolChanged { 
+                    .send(StrategyMessage::SymbolChanged {
                         symbol: Symbol(top_coin.symbol.clone()),
-                        specs 
+                        specs,
+                        price_change_24h: top_coin.price_change_24h, // Pass 24h change for trend protection
                     })
                     .await
                 {

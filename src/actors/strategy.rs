@@ -182,6 +182,8 @@ impl StrategyEngine {
                             warn!("❌ Order failed: {}, transitioning to Idle", error);
                             self.state = StrategyState::Idle;
                             self.current_position = None;
+                            // ✅ FIX MEMORY LEAK: Clear dynamic risk on order failure
+                            self.active_dynamic_risk = None;
                             // Reset confirmation state to avoid stale signals
                             self.pending_signal = None;
                             self.confirmation_count = 0;
@@ -260,6 +262,12 @@ impl StrategyEngine {
         self.pending_signal = None;
         self.confirmation_count = 0;
         self.state = StrategyState::Idle;
+        // ✅ FIX CRITICAL BUG: Clear VWAP cache on symbol switch
+        // CRITICAL: Old symbol's VWAP would cause completely wrong calculations!
+        self.cached_vwap_short = None;
+        self.cached_vwap_long = None;
+        self.cached_volatility = None;
+        self.last_cache_update = 0;
     }
 
     async fn handle_orderbook(&mut self, snapshot: OrderBookSnapshot) {
@@ -376,35 +384,40 @@ impl StrategyEngine {
 
         // ✅ FLASH CRASH PROTECTION: Detect extreme price movements
         // If we have an open position and price moves >5% in 1 second, emergency exit
-        if let Some(ref position) = self.current_position {
-            if self.tick_buffer.last().is_some() {
-                let pnl_pct = position.pnl_percent();
+        if let Some(ref mut position) = self.current_position {
+            // ✅ FIX: Update current_price from latest trade tick BEFORE checking PnL
+            // CRITICAL: position.current_price is updated in handle_orderbook(),
+            // but flash crash check happens in handle_trade() → stale price!
+            if let Some(last_tick) = self.tick_buffer.last() {
+                position.current_price = last_tick.price;
+            }
 
-                // Emergency exit on flash crash (>5% adverse move)
-                const FLASH_CRASH_THRESHOLD: f64 = -5.0; // -5% sudden loss
+            let pnl_pct = position.pnl_percent();
 
-                if pnl_pct < FLASH_CRASH_THRESHOLD {
-                    warn!(
-                        "⚡ FLASH CRASH DETECTED: PnL {:.2}% in <1sec! Emergency exit on {}",
-                        pnl_pct, position.symbol
-                    );
+            // Emergency exit on flash crash (>5% adverse move)
+            const FLASH_CRASH_THRESHOLD: f64 = -5.0; // -5% sudden loss
 
-                    self.state = StrategyState::ClosingPosition;
+            if pnl_pct < FLASH_CRASH_THRESHOLD {
+                warn!(
+                    "⚡ FLASH CRASH DETECTED: PnL {:.2}% in <1sec! Emergency exit on {}",
+                    pnl_pct, position.symbol
+                );
 
-                    if let Err(e) = self
-                        .execution_tx
-                        .send(ExecutionMessage::ClosePosition {
-                            symbol: position.symbol.clone(),
-                            position_side: position.side,
-                        })
-                        .await
-                    {
-                        warn!("Failed to send emergency ClosePosition: {}", e);
-                        self.state = StrategyState::PositionOpen;
-                    }
+                self.state = StrategyState::ClosingPosition;
 
-                    return;
+                if let Err(e) = self
+                    .execution_tx
+                    .send(ExecutionMessage::ClosePosition {
+                        symbol: position.symbol.clone(),
+                        position_side: position.side,
+                    })
+                    .await
+                {
+                    warn!("Failed to send emergency ClosePosition: {}", e);
+                    self.state = StrategyState::PositionOpen;
                 }
+
+                return;
             }
         }
 
@@ -455,21 +468,29 @@ impl StrategyEngine {
 
                 const PUMP_THRESHOLD: f64 = 0.15; // 15% threshold
 
+                // ✅ FIX LOG SPAM: Only warn if we were already confirming this signal
+                // Don't spam on every tick if momentum keeps showing wrong direction
                 if price_change > PUMP_THRESHOLD && !signal_is_bullish {
-                    warn!(
-                        "🚫 REJECTED: Attempted SHORT on PUMP coin (+{:.1}% 24h). Only LONG allowed.",
-                        price_change * 100.0
-                    );
+                    // Only log warning if we were actively confirming a SHORT signal
+                    if self.pending_signal == Some(false) {
+                        warn!(
+                            "🚫 REJECTED: Attempted SHORT on PUMP coin (+{:.1}% 24h). Only LONG allowed.",
+                            price_change * 100.0
+                        );
+                    }
                     self.pending_signal = None;
                     self.confirmation_count = 0;
                     return;
                 }
 
                 if price_change < -PUMP_THRESHOLD && signal_is_bullish {
-                    warn!(
-                        "🚫 REJECTED: Attempted LONG on DUMP coin ({:.1}% 24h). Only SHORT allowed.",
-                        price_change * 100.0
-                    );
+                    // Only log warning if we were actively confirming a LONG signal
+                    if self.pending_signal == Some(true) {
+                        warn!(
+                            "🚫 REJECTED: Attempted LONG on DUMP coin ({:.1}% 24h). Only SHORT allowed.",
+                            price_change * 100.0
+                        );
+                    }
                     self.pending_signal = None;
                     self.confirmation_count = 0;
                     return;
@@ -510,21 +531,28 @@ impl StrategyEngine {
                 if let Some(vwap_distance) = self.calculate_vwap_distance() {
                     const MAX_DISTANCE_TO_VWAP: f64 = 0.005; // 0.5% threshold
 
+                    // ✅ FIX LOG SPAM: Only warn if we were already confirming this signal
                     if signal_is_bullish && vwap_distance > MAX_DISTANCE_TO_VWAP {
-                        warn!(
-                            "🚫 ANTI-FOMO REJECTED: LONG blocked - price too far ABOVE VWAP (+{:.2}%). Waiting for pullback.",
-                            vwap_distance * 100.0
-                        );
+                        // Only log warning if we were actively confirming a LONG signal
+                        if self.pending_signal == Some(true) {
+                            warn!(
+                                "🚫 ANTI-FOMO REJECTED: LONG blocked - price too far ABOVE VWAP (+{:.2}%). Waiting for pullback.",
+                                vwap_distance * 100.0
+                            );
+                        }
                         self.pending_signal = None;
                         self.confirmation_count = 0;
                         return;
                     }
 
                     if !signal_is_bullish && vwap_distance < -MAX_DISTANCE_TO_VWAP {
-                        warn!(
-                            "🚫 ANTI-FOMO REJECTED: SHORT blocked - price too far BELOW VWAP ({:.2}%). Waiting for bounce.",
-                            vwap_distance * 100.0
-                        );
+                        // Only log warning if we were actively confirming a SHORT signal
+                        if self.pending_signal == Some(false) {
+                            warn!(
+                                "🚫 ANTI-FOMO REJECTED: SHORT blocked - price too far BELOW VWAP ({:.2}%). Waiting for bounce.",
+                                vwap_distance * 100.0
+                            );
+                        }
                         self.pending_signal = None;
                         self.confirmation_count = 0;
                         return;
@@ -885,6 +913,8 @@ impl StrategyEngine {
             .await
         {
             warn!("Failed to send PlaceOrder to execution: {}", e);
+            // ✅ FIX MEMORY LEAK: Clear dynamic risk if order send failed
+            self.active_dynamic_risk = None;
             // Revert state if send failed
             self.state = StrategyState::Idle;
         }

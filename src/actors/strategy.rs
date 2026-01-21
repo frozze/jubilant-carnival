@@ -81,6 +81,7 @@ impl StrategyEngine {
         message_rx: mpsc::Receiver<StrategyMessage>,
         execution_tx: mpsc::Sender<ExecutionMessage>,
     ) -> Self {
+        let momentum_threshold = config.momentum_threshold / 100.0; // Convert percentage to decimal
         Self {
             config,
             message_rx,
@@ -90,7 +91,7 @@ impl StrategyEngine {
             last_orderbook: None,
             current_specs: None,
             tick_buffer: RingBuffer::new(300), // ✅ EXPANDED: 300 ticks for better trend detection
-            momentum_threshold: 0.002, // ✅ STRICTER: 0.2% momentum threshold (was 0.1%)
+            momentum_threshold, // ✅ CONFIGURABLE: Read from env MOMENTUM_THRESHOLD (default 0.1%)
             state: StrategyState::Idle,
             pending_symbol_change: None,
             price_change_24h: None, // ✅ PUMP PROTECTION: Will be set on symbol change

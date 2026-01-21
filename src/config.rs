@@ -26,6 +26,9 @@ pub struct Config {
     pub max_spread_bps: f64,
     pub stale_data_threshold_ms: i64,
 
+    // Strategy parameters
+    pub momentum_threshold: f64,
+
     // ✅ PUMP PROTECTION: Blacklist specific symbols
     pub blacklist_symbols: Vec<String>,
 }
@@ -82,6 +85,11 @@ impl Config {
                 .unwrap_or_else(|_| "500".to_string())
                 .parse()
                 .unwrap_or(500),
+
+            momentum_threshold: env::var("MOMENTUM_THRESHOLD")
+                .unwrap_or_else(|_| "0.15".to_string())
+                .parse()
+                .unwrap_or(0.15),
 
             // ✅ PUMP PROTECTION: Parse blacklist (comma-separated symbols)
             blacklist_symbols: env::var("BLACKLIST_SYMBOLS")

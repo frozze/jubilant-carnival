@@ -152,6 +152,9 @@ impl StrategyEngine {
                             warn!("❌ Order failed: {}, transitioning to Idle", error);
                             self.state = StrategyState::Idle;
                             self.current_position = None;
+                            // Reset confirmation state to avoid stale signals
+                            self.pending_signal = None;
+                            self.confirmation_count = 0;
                         }
                     }
                 }

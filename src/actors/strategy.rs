@@ -331,8 +331,12 @@ impl StrategyEngine {
         // Add to buffer
         self.tick_buffer.push(tick.clone());
 
-        // ✅ FIXED: Increased to 50 ticks for noise reduction
-        if self.tick_buffer.len() < 50 {
+        // ✅ CRITICAL FIX: Need 200 ticks for FULL protection
+        // - calculate_momentum: requires 50 ticks
+        // - calculate_trend: requires 200 ticks (50 vs 200 VWAP)
+        // Without 200 ticks, trend alignment check returns None and is SKIPPED!
+        if self.tick_buffer.len() < 200 {
+            debug!("📊 Buffering ticks: {}/200", self.tick_buffer.len());
             return;
         }
 
@@ -361,35 +365,44 @@ impl StrategyEngine {
 
                 // ✅ PUMP PROTECTION: Global Trend Filter (24h price change)
                 // Prevents "Suicide Shorts" on parabolic pumps and "Suicide Longs" on crashes
-                if let Some(price_change) = self.price_change_24h {
-                    const PUMP_THRESHOLD: f64 = 0.15; // 15% threshold
-
-                    if price_change > PUMP_THRESHOLD && !signal_is_bullish {
-                        warn!(
-                            "🚫 REJECTED: Attempted SHORT on PUMP coin (+{:.1}% 24h). Only LONG allowed.",
-                            price_change * 100.0
-                        );
+                // ✅ CRITICAL FIX: Block entry if no 24h data available yet
+                let price_change = match self.price_change_24h {
+                    Some(pc) => pc,
+                    None => {
+                        debug!("⏸️ No 24h price data yet, waiting for first SymbolChanged");
                         self.pending_signal = None;
                         self.confirmation_count = 0;
                         return;
                     }
+                };
 
-                    if price_change < -PUMP_THRESHOLD && signal_is_bullish {
-                        warn!(
-                            "🚫 REJECTED: Attempted LONG on DUMP coin ({:.1}% 24h). Only SHORT allowed.",
-                            price_change * 100.0
-                        );
-                        self.pending_signal = None;
-                        self.confirmation_count = 0;
-                        return;
-                    }
+                const PUMP_THRESHOLD: f64 = 0.15; // 15% threshold
 
-                    debug!(
-                        "✅ Global trend check passed: {} signal on {:.1}% 24h",
-                        if signal_is_bullish { "LONG" } else { "SHORT" },
+                if price_change > PUMP_THRESHOLD && !signal_is_bullish {
+                    warn!(
+                        "🚫 REJECTED: Attempted SHORT on PUMP coin (+{:.1}% 24h). Only LONG allowed.",
                         price_change * 100.0
                     );
+                    self.pending_signal = None;
+                    self.confirmation_count = 0;
+                    return;
                 }
+
+                if price_change < -PUMP_THRESHOLD && signal_is_bullish {
+                    warn!(
+                        "🚫 REJECTED: Attempted LONG on DUMP coin ({:.1}% 24h). Only SHORT allowed.",
+                        price_change * 100.0
+                    );
+                    self.pending_signal = None;
+                    self.confirmation_count = 0;
+                    return;
+                }
+
+                debug!(
+                    "✅ Global trend check passed: {} signal on {:.1}% 24h",
+                    if signal_is_bullish { "LONG" } else { "SHORT" },
+                    price_change * 100.0
+                );
 
                 // ✅ IMPROVEMENT #2: Trend alignment - check if signal aligns with trend
                 

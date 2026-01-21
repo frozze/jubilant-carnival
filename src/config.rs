@@ -87,9 +87,9 @@ impl Config {
                 .unwrap_or(500),
 
             momentum_threshold: env::var("MOMENTUM_THRESHOLD")
-                .unwrap_or_else(|_| "0.1".to_string())
+                .unwrap_or_else(|_| "0.15".to_string())
                 .parse()
-                .unwrap_or(0.1),
+                .unwrap_or(0.15),
 
             // ✅ PUMP PROTECTION: Parse blacklist (comma-separated symbols)
             blacklist_symbols: env::var("BLACKLIST_SYMBOLS")

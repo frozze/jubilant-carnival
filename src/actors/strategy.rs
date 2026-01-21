@@ -428,6 +428,29 @@ impl StrategyEngine {
                     return;
                 }
 
+                // ✅ ANTI-FOMO: Buy Pullback Filter (only for LONG signals)
+                // Block LONG entries if price is too far above VWAP (buying the top)
+                if signal_is_bullish {
+                    if let Some(vwap_distance) = self.calculate_vwap_distance() {
+                        const MAX_DISTANCE_TO_VWAP: f64 = 0.005; // 0.5% above VWAP
+
+                        if vwap_distance > MAX_DISTANCE_TO_VWAP {
+                            warn!(
+                                "🚫 ANTI-FOMO REJECTED: Price too far above VWAP (+{:.2}%). Waiting for pullback.",
+                                vwap_distance * 100.0
+                            );
+                            self.pending_signal = None;
+                            self.confirmation_count = 0;
+                            return;
+                        }
+
+                        debug!(
+                            "✅ Anti-FOMO check passed: Price {:.2}% from VWAP (max +0.5%)",
+                            vwap_distance * 100.0
+                        );
+                    }
+                }
+
                 // ✅ IMPROVEMENT #1: Confirmation delay
                 if let Some(pending_bullish) = self.pending_signal {
                     // Check if current signal matches pending
@@ -555,12 +578,131 @@ impl StrategyEngine {
         }
     }
 
+    /// ✅ ATR-BASED: Calculate tick volatility (standard deviation of price changes)
+    /// Uses last 100 ticks to measure market "choppiness"
+    fn calculate_volatility(&self) -> Option<f64> {
+        let ticks: Vec<&TradeTick> = self.tick_buffer.iter().collect();
+
+        // Need at least 100 ticks for reliable volatility measurement
+        if ticks.len() < 100 {
+            return None;
+        }
+
+        // Calculate price changes (returns) for last 100 ticks
+        let recent_ticks: Vec<&TradeTick> = ticks.iter().rev().take(100).copied().collect();
+        let mut price_changes: Vec<f64> = Vec::with_capacity(99);
+
+        for i in 0..recent_ticks.len() - 1 {
+            let current_price = recent_ticks[i].price.to_f64().unwrap_or(0.0);
+            let prev_price = recent_ticks[i + 1].price.to_f64().unwrap_or(0.0);
+
+            if prev_price > 0.0 {
+                let change = (current_price - prev_price).abs() / prev_price;
+                price_changes.push(change);
+            }
+        }
+
+        if price_changes.is_empty() {
+            return None;
+        }
+
+        // Calculate mean
+        let mean: f64 = price_changes.iter().sum::<f64>() / price_changes.len() as f64;
+
+        // Calculate standard deviation
+        let variance: f64 = price_changes
+            .iter()
+            .map(|x| {
+                let diff = x - mean;
+                diff * diff
+            })
+            .sum::<f64>()
+            / price_changes.len() as f64;
+
+        let std_dev = variance.sqrt();
+
+        Some(std_dev)
+    }
+
+    /// ✅ ATR-BASED: Calculate dynamic Stop Loss based on volatility
+    /// Returns: (stop_loss_percent, take_profit_percent)
+    fn calculate_dynamic_risk(&self) -> (f64, f64) {
+        const MIN_SL_PERCENT: f64 = 0.7; // 0.7% minimum SL
+        const MAX_SL_PERCENT: f64 = 3.0; // 3.0% maximum SL
+        const VOLATILITY_MULTIPLIER: f64 = 2.0; // SL = 2x volatility
+        const TP_MULTIPLIER: f64 = 1.5; // TP = 1.5x SL (positive R:R)
+
+        let volatility = match self.calculate_volatility() {
+            Some(vol) => vol * 100.0, // Convert to percentage
+            None => {
+                // Fallback to config defaults if can't calculate volatility
+                return (self.config.stop_loss_percent, self.config.take_profit_percent);
+            }
+        };
+
+        // Calculate dynamic SL based on volatility
+        let dynamic_sl = volatility * VOLATILITY_MULTIPLIER;
+
+        // Clamp to min/max range
+        let clamped_sl = dynamic_sl.max(MIN_SL_PERCENT).min(MAX_SL_PERCENT);
+
+        // Calculate TP as multiple of SL
+        let dynamic_tp = clamped_sl * TP_MULTIPLIER;
+
+        debug!(
+            "📊 Dynamic Risk: Volatility={:.3}%, SL={:.2}% (raw={:.2}%), TP={:.2}%",
+            volatility, clamped_sl, dynamic_sl, dynamic_tp
+        );
+
+        (clamped_sl, dynamic_tp)
+    }
+
+    /// ✅ ANTI-FOMO: Calculate distance from current price to long-term VWAP
+    /// Returns: distance as percentage (positive = above VWAP, negative = below)
+    fn calculate_vwap_distance(&self) -> Option<f64> {
+        let ticks: Vec<&TradeTick> = self.tick_buffer.iter().collect();
+
+        // Need 200 ticks for long-term VWAP
+        if ticks.len() < 200 {
+            return None;
+        }
+
+        // Calculate long VWAP (200 ticks)
+        let mut total_value = Decimal::ZERO;
+        let mut total_volume = Decimal::ZERO;
+
+        for tick in ticks.iter().rev().take(200) {
+            total_value += tick.price * tick.size;
+            total_volume += tick.size;
+        }
+
+        if total_volume == Decimal::ZERO {
+            return None;
+        }
+
+        let vwap_200 = total_value / total_volume;
+
+        // Get current price
+        let current_price = self.tick_buffer.last()?.price;
+
+        // Calculate distance as percentage
+        let distance_dec = (current_price - vwap_200) / vwap_200;
+        let distance = distance_dec.to_f64().unwrap_or(0.0);
+
+        Some(distance)
+    }
+
     async fn execute_entry(&mut self, momentum: f64, orderbook: &OrderBookSnapshot) {
+        // ✅ ATR-BASED: Calculate dynamic risk parameters
+        let (dynamic_sl_percent, dynamic_tp_percent) = self.calculate_dynamic_risk();
+
         info!(
-            "🎯 ENTRY SIGNAL: {} momentum={:.4}% spread={:.2}bps",
+            "🎯 ENTRY SIGNAL: {} momentum={:.4}% spread={:.2}bps | Dynamic SL={:.2}% TP={:.2}%",
             orderbook.symbol,
             momentum * 100.0,
-            orderbook.spread_bps
+            orderbook.spread_bps,
+            dynamic_sl_percent,
+            dynamic_tp_percent
         );
 
         // Determine side
@@ -570,8 +712,24 @@ impl StrategyEngine {
             OrderSide::Sell
         };
 
-        // Calculate position size
-        let position_value = Decimal::from_str_exact(&self.config.max_position_size_usd.to_string())
+        // ✅ RISK-ADJUSTED POSITION SIZING
+        // Goal: Lose same dollar amount regardless of SL size
+        // Formula: Position_Size = Risk_Amount / (SL_Percent / 100)
+        const RISK_AMOUNT_USD: f64 = 10.0; // Risk $10 per trade
+
+        let sl_decimal = dynamic_sl_percent / 100.0; // Convert to decimal (e.g., 1.5% -> 0.015)
+        let risk_adjusted_position_usd = RISK_AMOUNT_USD / sl_decimal;
+
+        // Cap at max_position_size_usd for safety
+        let max_position_usd = self.config.max_position_size_usd;
+        let final_position_usd = risk_adjusted_position_usd.min(max_position_usd);
+
+        debug!(
+            "💰 Position Sizing: Risk=${:.2}, SL={:.2}%, Calculated=${:.2}, Capped=${:.2}",
+            RISK_AMOUNT_USD, dynamic_sl_percent, risk_adjusted_position_usd, final_position_usd
+        );
+
+        let position_value = Decimal::from_str_exact(&final_position_usd.to_string())
             .unwrap_or(Decimal::from(1000));
 
         let mut qty = position_value / orderbook.mid_price;

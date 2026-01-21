@@ -155,10 +155,10 @@ impl StrategyEngine {
                                     warn!("SwitchingSymbol state but no pending change!");
                                     self.state = StrategyState::Idle;
                                 }
-                            } else if position.is_none() {
-                                // ✅ FIX BUG #9: Position disappeared unexpectedly (liquidation, margin call, etc.)
-                                // CRITICAL: If we're in OrderPending or any other state and position vanishes,
-                                // we must reset to Idle or we'll be stuck forever!
+                            } else if position.is_none() && !matches!(self.state, StrategyState::Idle) {
+                                // ✅ FIX BUG #14: Only warn if position disappeared in states where we EXPECT a position
+                                // CRITICAL: Don't spam warnings in Idle state - no position is NORMAL there!
+                                // Only trigger if we're in OrderPending, PositionOpen, or other states that expect a position
                                 warn!(
                                     "⚠️  Position disappeared unexpectedly in state {:?} (liquidation? margin call?). Resetting to Idle.",
                                     self.state

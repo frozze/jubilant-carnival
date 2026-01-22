@@ -1031,10 +1031,10 @@ impl StrategyEngine {
         };
 
         // ✅ RISK-ADJUSTED POSITION SIZING (FIXED DOLLAR RISK)
-        // Goal: Lose exactly $0.30 regardless of SL size or volatility
+        // Goal: Lose exactly $X regardless of SL size or volatility
         // Formula: Position_Size = Risk_Amount / (SL_Percent / 100)
         // Example: SL 1% → Position $30, SL 3% → Position $10 (both risk $0.30)
-        const RISK_AMOUNT_USD: f64 = 0.30; // Fixed risk: $0.30 per trade
+        let risk_amount_usd = self.config.risk_amount_usd;
 
         // ✅ FIX BUG #29 (CRITICAL): Prevent division by zero
         if dynamic_sl_percent <= 0.0 {
@@ -1049,7 +1049,7 @@ impl StrategyEngine {
         }
 
         let sl_decimal = dynamic_sl_percent / 100.0; // Convert to decimal (e.g., 1.5% -> 0.015)
-        let risk_adjusted_position_usd = RISK_AMOUNT_USD / sl_decimal;
+        let risk_adjusted_position_usd = risk_amount_usd / sl_decimal;
 
         // Cap at max_position_size_usd for safety
         let max_position_usd = self.config.max_position_size_usd;
@@ -1057,7 +1057,7 @@ impl StrategyEngine {
 
         debug!(
             "💰 Position Sizing: Risk=${:.2}, SL={:.2}%, Calculated=${:.2}, Capped=${:.2}",
-            RISK_AMOUNT_USD, dynamic_sl_percent, risk_adjusted_position_usd, final_position_usd
+            risk_amount_usd, dynamic_sl_percent, risk_adjusted_position_usd, final_position_usd
         );
 
         let position_value = Decimal::from_str_exact(&final_position_usd.to_string())

@@ -30,6 +30,9 @@ pub struct Config {
     pub momentum_threshold: f64,
     pub min_trend_strength: f64,
 
+    // ✅ Fixed dollar risk per trade
+    pub risk_amount_usd: f64,
+
     // ✅ PUMP PROTECTION: Blacklist specific symbols
     pub blacklist_symbols: Vec<String>,
 }
@@ -97,6 +100,12 @@ impl Config {
                 .parse::<f64>()
                 .unwrap_or(0.1)
                 / 100.0, // Convert percentage to decimal (0.1 → 0.001)
+
+            // ✅ Fixed dollar risk per trade (default $0.30)
+            risk_amount_usd: env::var("RISK_AMOUNT_USD")
+                .unwrap_or_else(|_| "0.30".to_string())
+                .parse()
+                .unwrap_or(0.30),
 
             // ✅ PUMP PROTECTION: Parse blacklist (comma-separated symbols)
             blacklist_symbols: env::var("BLACKLIST_SYMBOLS")

@@ -195,7 +195,7 @@ impl MarketDataActor {
             if topic.starts_with("orderbook") {
                 self.handle_orderbook(ws_msg)?;
             } else if topic.starts_with("publicTrade") {
-                self.handle_trade(ws_msg)?;
+                self.handle_trade(ws_msg).await?;
             }
         }
 
@@ -252,7 +252,7 @@ impl MarketDataActor {
         Ok(())
     }
 
-    fn handle_trade(&self, msg: WsMessage) -> Result<()> {
+    async fn handle_trade(&self, msg: WsMessage) -> Result<()> {
         if let Some(data_array) = msg.data {
             if let Some(trades) = data_array.as_array() {
                 for trade_data in trades {
@@ -301,10 +301,24 @@ impl MarketDataActor {
                             side,
                         };
 
-                        // ✅ FIXED: Use try_send to avoid task explosion (100x faster)
-                        if let Err(e) = self.strategy_tx.try_send(StrategyMessage::Trade(tick)) {
-                             // It's normal to drop packets in HFT if consumer is slow
-                             debug!("Dropped trade tick: {}", e);
+                        // ✅ FIX BUG #32 (HIGH): Trade ticks are CRITICAL for VWAP!
+                        // CANNOT use try_send - dropped ticks = incomplete VWAP = wrong signals!
+                        // Use send with timeout to detect if Strategy is slow (shouldn't happen)
+                        match tokio::time::timeout(
+                            tokio::time::Duration::from_millis(100),
+                            self.strategy_tx.send(StrategyMessage::Trade(tick))
+                        ).await {
+                            Ok(Ok(_)) => {
+                                // Tick sent successfully
+                            }
+                            Ok(Err(e)) => {
+                                error!("⚠️  BUG #32: Failed to send trade tick (channel closed?): {}", e);
+                            }
+                            Err(_) => {
+                                // Timeout - Strategy is too slow! This should NEVER happen
+                                error!("⚠️  BUG #32: Trade tick send TIMEOUT! Strategy actor is blocking!");
+                                error!("⚠️  CRITICAL: VWAP data will be incomplete, signals unreliable!");
+                            }
                         }
                     }
                 }

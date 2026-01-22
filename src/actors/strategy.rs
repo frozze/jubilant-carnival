@@ -7,7 +7,7 @@ use rust_decimal::prelude::ToPrimitive;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// ✅ FIXED: Proper state machine for order lifecycle
 #[derive(Debug, Clone, PartialEq)]
@@ -59,6 +59,10 @@ pub struct StrategyEngine {
     /// Cooldown duration in seconds (configurable)
     trade_cooldown_secs: u64,
 
+    // ✅ FIX INFINITE CLOSE LOOP: Rate limit for close attempts
+    /// When we last sent ClosePosition request
+    last_close_attempt: Option<Instant>,
+
     // ✅ FIX MEMORY LOSS BUG: Store active dynamic risk for current position
     /// Stores (SL%, TP%) calculated for the current active trade
     /// CRITICAL: Must use these values in handle_orderbook, NOT config values!
@@ -101,6 +105,8 @@ impl StrategyEngine {
             // ✅ IMPROVEMENT #3: Trade cooldown (30 seconds)
             last_trade_time: None,
             trade_cooldown_secs: 30,
+            // ✅ FIX INFINITE CLOSE LOOP: Initialize rate limit
+            last_close_attempt: None,
             // ✅ FIX MEMORY LOSS BUG: Initialize dynamic risk storage
             active_dynamic_risk: None,
             // ✅ PERFORMANCE: Initialize VWAP cache
@@ -142,6 +148,8 @@ impl StrategyEngine {
                                 self.last_trade_time = Some(Instant::now());
                                 // ✅ FIX MEMORY LOSS BUG: Clear dynamic risk when position closes
                                 self.active_dynamic_risk = None;
+                                // ✅ FIX BUG #18: Clear close attempt timestamp
+                                self.last_close_attempt = None;
                                 self.state = StrategyState::Idle;
                             } else if self.state == StrategyState::SwitchingSymbol {
                                 // ✅ FIX BUG #1: Now complete the pending symbol change
@@ -150,16 +158,24 @@ impl StrategyEngine {
                                 self.last_trade_time = Some(Instant::now());
                                 // ✅ FIX MEMORY LOSS BUG: Clear dynamic risk when position closes
                                 self.active_dynamic_risk = None;
+                                // ✅ FIX BUG #18: Clear close attempt timestamp
+                                self.last_close_attempt = None;
                                 if let Some((new_symbol, specs, price_change_24h)) = self.pending_symbol_change.take() {
                                     self.complete_symbol_switch(new_symbol, specs, price_change_24h);
                                 } else {
                                     warn!("SwitchingSymbol state but no pending change!");
                                     self.state = StrategyState::Idle;
                                 }
-                            } else if position.is_none() && !matches!(self.state, StrategyState::Idle) {
-                                // ✅ FIX BUG #14: Only warn if position disappeared in states where we EXPECT a position
-                                // CRITICAL: Don't spam warnings in Idle state - no position is NORMAL there!
-                                // Only trigger if we're in OrderPending, PositionOpen, or other states that expect a position
+                            } else if position.is_none() && matches!(self.state, StrategyState::PositionOpen | StrategyState::SwitchingSymbol) {
+                                // ✅ FIX BUG #16 (CRITICAL): Only reset if position disappeared in states where we HAVE a position
+                                // CRITICAL STATES TO CHECK:
+                                // - PositionOpen: Position should exist, if None = liquidation/margin call
+                                // - SwitchingSymbol: We're closing position, if None = position closed
+                                //
+                                // DO NOT CHECK in these states:
+                                // - Idle: No position expected (normal)
+                                // - OrderPending: Position doesn't exist yet (order not filled)
+                                // - ClosingPosition: Position disappearing is EXPECTED
                                 warn!(
                                     "⚠️  Position disappeared unexpectedly in state {:?} (liquidation? margin call?). Resetting to Idle.",
                                     self.state
@@ -243,18 +259,29 @@ impl StrategyEngine {
             self.pending_symbol_change = Some((new_symbol, specs, price_change_24h));
             self.state = StrategyState::SwitchingSymbol;
 
-            if let Err(e) = self
-                .execution_tx
-                .send(ExecutionMessage::ClosePosition {
+            // ✅ FIX BUG #17 (CRITICAL): Use timeout to prevent blocking if ExecutionActor hangs
+            let send_result = tokio::time::timeout(
+                Duration::from_secs(5),
+                self.execution_tx.send(ExecutionMessage::ClosePosition {
                     symbol: position.symbol.clone(),
                     position_side: position.side,
                 })
-                .await
-            {
-                warn!("Failed to send ClosePosition on symbol change: {}", e);
-                // Fallback: complete switch anyway to avoid getting stuck
-                if let Some((sym, sp, pc)) = self.pending_symbol_change.take() {
-                    self.complete_symbol_switch(sym, sp, pc);
+            ).await;
+
+            match send_result {
+                Ok(Ok(_)) => { /* Message sent successfully */ }
+                Ok(Err(e)) => {
+                    warn!("Failed to send ClosePosition on symbol change: {}", e);
+                    // Fallback: complete switch anyway to avoid getting stuck
+                    if let Some((sym, sp, pc)) = self.pending_symbol_change.take() {
+                        self.complete_symbol_switch(sym, sp, pc);
+                    }
+                }
+                Err(_) => {
+                    warn!("⚠️  CRITICAL: ExecutionActor not responding (timeout 5s)! Force completing symbol switch.");
+                    if let Some((sym, sp, pc)) = self.pending_symbol_change.take() {
+                        self.complete_symbol_switch(sym, sp, pc);
+                    }
                 }
             }
             // DON'T switch yet - wait for PositionUpdate(None)
@@ -300,6 +327,12 @@ impl StrategyEngine {
             }
         }
 
+        // ✅ FIX INFINITE CLOSE LOOP: Don't process exit logic if already closing or ordering
+        // CRITICAL: orderbook updates come faster than state transitions, causing spam!
+        if self.state == StrategyState::ClosingPosition || self.state == StrategyState::OrderPending {
+            return;
+        }
+
         // Update current price if we have a position
         if let Some(ref mut position) = self.current_position {
             position.current_price = snapshot.mid_price;
@@ -315,6 +348,14 @@ impl StrategyEngine {
 
             // Check stop loss using dynamic SL target
             if pnl_pct <= -sl_target {
+                // ✅ FIX RATE LIMIT: Don't spam close requests
+                if let Some(last_attempt) = self.last_close_attempt {
+                    if last_attempt.elapsed().as_secs() < 2 {
+                        debug!("⏳ Rate limit: Close attempt throttled (< 2s since last)");
+                        return;
+                    }
+                }
+
                 warn!(
                     "🛑 STOP LOSS triggered for {} at {} (PnL: {:.2}% | Target: -{:.2}% {})",
                     position.symbol,
@@ -326,17 +367,27 @@ impl StrategyEngine {
 
                 // ✅ FIXED: Transition to ClosingPosition state
                 self.state = StrategyState::ClosingPosition;
+                self.last_close_attempt = Some(Instant::now());
 
-                if let Err(e) = self
-                    .execution_tx
-                    .send(ExecutionMessage::ClosePosition {
+                // ✅ FIX BUG #17 (CRITICAL): Use timeout to prevent blocking
+                let send_result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    self.execution_tx.send(ExecutionMessage::ClosePosition {
                         symbol: position.symbol.clone(),
                         position_side: position.side,
                     })
-                    .await
-                {
-                    warn!("Failed to send ClosePosition for stop loss: {}", e);
-                    self.state = StrategyState::PositionOpen; // Revert state on failure
+                ).await;
+
+                match send_result {
+                    Ok(Ok(_)) => { /* SL close sent successfully */ }
+                    Ok(Err(e)) => {
+                        warn!("Failed to send ClosePosition for stop loss: {}", e);
+                        self.state = StrategyState::PositionOpen; // Revert state on failure
+                    }
+                    Err(_) => {
+                        warn!("⚠️  CRITICAL: ExecutionActor timeout on SL! Reverting state.");
+                        self.state = StrategyState::PositionOpen;
+                    }
                 }
 
                 return;
@@ -344,6 +395,14 @@ impl StrategyEngine {
 
             // Check take profit using dynamic TP target
             if pnl_pct >= tp_target {
+                // ✅ FIX RATE LIMIT: Don't spam close requests
+                if let Some(last_attempt) = self.last_close_attempt {
+                    if last_attempt.elapsed().as_secs() < 2 {
+                        debug!("⏳ Rate limit: Close attempt throttled (< 2s since last)");
+                        return;
+                    }
+                }
+
                 info!(
                     "💰 TAKE PROFIT hit for {} (PnL: {:.2}% | Target: {:.2}% {})",
                     position.symbol,
@@ -354,17 +413,27 @@ impl StrategyEngine {
 
                 // ✅ FIXED: Transition to ClosingPosition state
                 self.state = StrategyState::ClosingPosition;
+                self.last_close_attempt = Some(Instant::now());
 
-                if let Err(e) = self
-                    .execution_tx
-                    .send(ExecutionMessage::ClosePosition {
+                // ✅ FIX BUG #17 (CRITICAL): Use timeout to prevent blocking
+                let send_result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    self.execution_tx.send(ExecutionMessage::ClosePosition {
                         symbol: position.symbol.clone(),
                         position_side: position.side,
                     })
-                    .await
-                {
-                    warn!("Failed to send ClosePosition for take profit: {}", e);
-                    self.state = StrategyState::PositionOpen; // Revert state on failure
+                ).await;
+
+                match send_result {
+                    Ok(Ok(_)) => { /* TP close sent successfully */ }
+                    Ok(Err(e)) => {
+                        warn!("Failed to send ClosePosition for take profit: {}", e);
+                        self.state = StrategyState::PositionOpen; // Revert state on failure
+                    }
+                    Err(_) => {
+                        warn!("⚠️  CRITICAL: ExecutionActor timeout on TP! Reverting state.");
+                        self.state = StrategyState::PositionOpen;
+                    }
                 }
 
                 return;
@@ -407,6 +476,11 @@ impl StrategyEngine {
             self.last_cache_update = self.tick_counter;
         }
 
+        // ✅ FIX INFINITE CLOSE LOOP: Don't process flash crash exit if already closing
+        if self.state == StrategyState::ClosingPosition || self.state == StrategyState::OrderPending {
+            return;
+        }
+
         // ✅ FLASH CRASH PROTECTION: Detect extreme price movements
         // If we have an open position and price moves >5% in 1 second, emergency exit
         if let Some(ref mut position) = self.current_position {
@@ -434,23 +508,41 @@ impl StrategyEngine {
             const FLASH_CRASH_THRESHOLD: f64 = -5.0; // -5% sudden loss
 
             if pnl_pct < FLASH_CRASH_THRESHOLD {
+                // ✅ FIX RATE LIMIT: Don't spam close requests
+                if let Some(last_attempt) = self.last_close_attempt {
+                    if last_attempt.elapsed().as_secs() < 2 {
+                        debug!("⏳ Rate limit: Flash crash close throttled (< 2s since last)");
+                        return;
+                    }
+                }
+
                 warn!(
                     "⚡ FLASH CRASH DETECTED: PnL {:.2}% in <1sec! Emergency exit on {}",
                     pnl_pct, position.symbol
                 );
 
                 self.state = StrategyState::ClosingPosition;
+                self.last_close_attempt = Some(Instant::now());
 
-                if let Err(e) = self
-                    .execution_tx
-                    .send(ExecutionMessage::ClosePosition {
+                // ✅ FIX BUG #17 (CRITICAL): Use timeout to prevent blocking
+                let send_result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    self.execution_tx.send(ExecutionMessage::ClosePosition {
                         symbol: position.symbol.clone(),
                         position_side: position.side,
                     })
-                    .await
-                {
-                    warn!("Failed to send emergency ClosePosition: {}", e);
-                    self.state = StrategyState::PositionOpen;
+                ).await;
+
+                match send_result {
+                    Ok(Ok(_)) => { /* Flash crash emergency close sent */ }
+                    Ok(Err(e)) => {
+                        warn!("Failed to send emergency ClosePosition: {}", e);
+                        self.state = StrategyState::PositionOpen;
+                    }
+                    Err(_) => {
+                        warn!("⚠️  CRITICAL: ExecutionActor timeout on flash crash exit! Reverting state.");
+                        self.state = StrategyState::PositionOpen;
+                    }
                 }
 
                 return;
@@ -593,6 +685,33 @@ impl StrategyEngine {
                     self.pending_signal = None;
                     self.confirmation_count = 0;
                     return;
+                }
+
+                // ✅ TREND STRENGTH FILTER: Check if trend is strong enough
+                // Prevents trading in sideways/choppy markets (50% winrate killer!)
+                let short_vwap = self.get_vwap_short().unwrap_or(Decimal::ZERO);
+                let long_vwap = self.get_vwap_long().unwrap_or(Decimal::ZERO);
+
+                if short_vwap > Decimal::ZERO && long_vwap > Decimal::ZERO {
+                    let trend_strength_dec = (short_vwap - long_vwap).abs() / long_vwap;
+                    let trend_strength = trend_strength_dec.to_f64().unwrap_or(0.0);
+
+                    if trend_strength < self.config.min_trend_strength {
+                        debug!(
+                            "📉 Trend too weak: {:.4}% < {:.4}% (sideways market, skipping)",
+                            trend_strength * 100.0,
+                            self.config.min_trend_strength * 100.0
+                        );
+                        self.pending_signal = None;
+                        self.confirmation_count = 0;
+                        return;
+                    }
+
+                    debug!(
+                        "✅ Trend strength check passed: {:.4}% > {:.4}%",
+                        trend_strength * 100.0,
+                        self.config.min_trend_strength * 100.0
+                    );
                 }
 
                 // ✅ ANTI-FOMO: Symmetric Mean Reversion Filter
@@ -765,6 +884,13 @@ impl StrategyEngine {
         // ✅ PERFORMANCE: Use cached 50-tick VWAP instead of recalculating
         let vwap = self.get_vwap_short()?;
 
+        // ✅ FIX BUG #19 (DEFENSIVE): Prevent division by zero
+        // Theoretically impossible (exchange never sends price=0), but defensive check
+        if vwap == Decimal::ZERO {
+            warn!("⚠️  VWAP is zero (exchange data error?), cannot calculate momentum");
+            return None;
+        }
+
         // Compare last price to VWAP
         let last_tick = self.tick_buffer.last()?;
         let momentum_dec = (last_tick.price - vwap) / vwap;
@@ -832,8 +958,18 @@ impl StrategyEngine {
         let volatility = match self.calculate_volatility() {
             Some(vol) => vol * 100.0, // Convert to percentage
             None => {
-                // Fallback to config defaults if can't calculate volatility
-                return (self.config.stop_loss_percent, self.config.take_profit_percent);
+                // ✅ FIX BUG #29: Ensure config fallback is safe
+                let fallback_sl = self.config.stop_loss_percent.max(MIN_SL_PERCENT);
+                let fallback_tp = self.config.take_profit_percent.max(fallback_sl * TP_MULTIPLIER);
+
+                if self.config.stop_loss_percent < MIN_SL_PERCENT {
+                    warn!(
+                        "⚠️  Config SL {:.2}% too low, using minimum {:.2}%",
+                        self.config.stop_loss_percent, MIN_SL_PERCENT
+                    );
+                }
+
+                return (fallback_sl, fallback_tp);
             }
         };
 
@@ -899,6 +1035,18 @@ impl StrategyEngine {
         // Formula: Position_Size = Risk_Amount / (SL_Percent / 100)
         // Example: SL 1% → Position $30, SL 3% → Position $10 (both risk $0.30)
         const RISK_AMOUNT_USD: f64 = 0.30; // Fixed risk: $0.30 per trade
+
+        // ✅ FIX BUG #29 (CRITICAL): Prevent division by zero
+        if dynamic_sl_percent <= 0.0 {
+            error!(
+                "❌ BUG #29 CAUGHT! Invalid SL percent: {:.4}% (must be > 0)",
+                dynamic_sl_percent
+            );
+            error!("⚠️  Cannot calculate position size with zero/negative SL, aborting entry");
+            self.pending_signal = None;
+            self.confirmation_count = 0;
+            return;
+        }
 
         let sl_decimal = dynamic_sl_percent / 100.0; // Convert to decimal (e.g., 1.5% -> 0.015)
         let risk_adjusted_position_usd = RISK_AMOUNT_USD / sl_decimal;

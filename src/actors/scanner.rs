@@ -17,6 +17,8 @@ pub struct ScannerActor {
     specs_cache: SpecsCache,
     current_symbol: Option<Symbol>,
     current_score: f64,
+    // ✅ FIX RECONNECT: Track first scan to ensure subscription after restart
+    first_scan: bool,
 }
 
 impl ScannerActor {
@@ -34,6 +36,7 @@ impl ScannerActor {
             specs_cache: SpecsCache::new(),
             current_symbol: None,
             current_score: 0.0,
+            first_scan: true, // ✅ FIX RECONNECT: Ensure first scan always sends messages
         }
     }
 
@@ -151,12 +154,11 @@ impl ScannerActor {
                 true
             };
 
-            if should_switch {
-                info!(
-                    "🔄 Switching to new coin: {} (score: {:.2e} -> {:.2e})",
-                    top_coin.symbol, self.current_score, top_coin.score
-                );
+            // ✅ FIX RECONNECT: Always send messages on first scan (even if same symbol)
+            // This ensures WebSocket resubscribes after reconnect
+            let should_notify = should_switch || self.first_scan;
 
+            if should_notify {
                 // Fetch instrument specs if not cached
                 let specs = if let Some(cached) = self.specs_cache.get(&top_coin.symbol) {
                     cached
@@ -174,21 +176,43 @@ impl ScannerActor {
                     }
                 };
 
-                self.current_symbol = Some(Symbol(top_coin.symbol.clone()));
-                self.current_score = top_coin.score;
+                if should_switch {
+                    info!(
+                        "🔄 Switching to new coin: {} (score: {:.2e} -> {:.2e})",
+                        top_coin.symbol, self.current_score, top_coin.score
+                    );
 
-                // Send switch command to MarketDataActor
-                if let Err(e) = self
-                    .market_data_tx
-                    .send(MarketDataMessage::SwitchSymbol(Symbol(
-                        top_coin.symbol.clone(),
-                    )))
-                    .await
-                {
-                    error!("Failed to send symbol switch message: {}", e);
+                    self.current_symbol = Some(Symbol(top_coin.symbol.clone()));
+                    self.current_score = top_coin.score;
+
+                    // Send switch command to MarketDataActor (only on actual switch)
+                    if let Err(e) = self
+                        .market_data_tx
+                        .send(MarketDataMessage::SwitchSymbol(Symbol(
+                            top_coin.symbol.clone(),
+                        )))
+                        .await
+                    {
+                        error!("Failed to send symbol switch message: {}", e);
+                    }
+                } else if self.first_scan {
+                    // First scan after start - same symbol but need to notify
+                    info!("✅ Current coin {} confirmed optimal (first scan after start)",
+                        self.current_symbol.as_ref().unwrap());
+
+                    // Still send SwitchSymbol to ensure WebSocket subscribes
+                    if let Err(e) = self
+                        .market_data_tx
+                        .send(MarketDataMessage::SwitchSymbol(Symbol(
+                            top_coin.symbol.clone(),
+                        )))
+                        .await
+                    {
+                        error!("Failed to send symbol switch message: {}", e);
+                    }
                 }
-                
-                // Send specs to StrategyEngine
+
+                // Always send specs to StrategyEngine when notifying
                 if let Err(e) = self
                     .strategy_tx
                     .send(StrategyMessage::SymbolChanged {
@@ -200,6 +224,9 @@ impl ScannerActor {
                 {
                     error!("Failed to send symbol specs to strategy: {}", e);
                 }
+
+                // Clear first_scan flag
+                self.first_scan = false;
             } else {
                 info!("✅ Current coin {} still optimal", self.current_symbol.as_ref().unwrap());
             }

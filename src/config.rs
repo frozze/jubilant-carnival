@@ -28,6 +28,7 @@ pub struct Config {
 
     // Strategy parameters
     pub momentum_threshold: f64,
+    pub min_trend_strength: f64,
 
     // ✅ PUMP PROTECTION: Blacklist specific symbols
     pub blacklist_symbols: Vec<String>,
@@ -90,6 +91,12 @@ impl Config {
                 .unwrap_or_else(|_| "0.15".to_string())
                 .parse()
                 .unwrap_or(0.15),
+
+            min_trend_strength: env::var("MIN_TREND_STRENGTH")
+                .unwrap_or_else(|_| "0.1".to_string())
+                .parse::<f64>()
+                .unwrap_or(0.1)
+                / 100.0, // Convert percentage to decimal (0.1 → 0.001)
 
             // ✅ PUMP PROTECTION: Parse blacklist (comma-separated symbols)
             blacklist_symbols: env::var("BLACKLIST_SYMBOLS")

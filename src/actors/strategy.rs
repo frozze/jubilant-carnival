@@ -595,6 +595,33 @@ impl StrategyEngine {
                     return;
                 }
 
+                // ✅ TREND STRENGTH FILTER: Check if trend is strong enough
+                // Prevents trading in sideways/choppy markets (50% winrate killer!)
+                let short_vwap = self.get_vwap_short().unwrap_or(Decimal::ZERO);
+                let long_vwap = self.get_vwap_long().unwrap_or(Decimal::ZERO);
+
+                if short_vwap > Decimal::ZERO && long_vwap > Decimal::ZERO {
+                    let trend_strength_dec = (short_vwap - long_vwap).abs() / long_vwap;
+                    let trend_strength = trend_strength_dec.to_f64().unwrap_or(0.0);
+
+                    if trend_strength < self.config.min_trend_strength {
+                        debug!(
+                            "📉 Trend too weak: {:.4}% < {:.4}% (sideways market, skipping)",
+                            trend_strength * 100.0,
+                            self.config.min_trend_strength * 100.0
+                        );
+                        self.pending_signal = None;
+                        self.confirmation_count = 0;
+                        return;
+                    }
+
+                    debug!(
+                        "✅ Trend strength check passed: {:.4}% > {:.4}%",
+                        trend_strength * 100.0,
+                        self.config.min_trend_strength * 100.0
+                    );
+                }
+
                 // ✅ ANTI-FOMO: Symmetric Mean Reversion Filter
                 // Block entries if price is too far from VWAP (buying top / selling bottom)
                 if let Some(vwap_distance) = self.calculate_vwap_distance() {

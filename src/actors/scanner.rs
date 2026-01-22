@@ -6,7 +6,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// The "Predator" Scanner - hunts for high-volatility coins
 pub struct ScannerActor {
@@ -101,6 +101,12 @@ impl ScannerActor {
 
                 // Filter by minimum turnover
                 if turnover_24h < self.config.min_turnover_24h_usd {
+                    return None;
+                }
+
+                // ✅ FIX BUG #30: Check blacklist BEFORE selecting symbol
+                if self.config.blacklist_symbols.contains(&symbol.to_uppercase()) {
+                    debug!("⛔ Symbol {} is blacklisted, excluding from scan", symbol);
                     return None;
                 }
 

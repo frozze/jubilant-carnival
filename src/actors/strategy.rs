@@ -7,7 +7,7 @@ use rust_decimal::prelude::ToPrimitive;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// ✅ FIXED: Proper state machine for order lifecycle
 #[derive(Debug, Clone, PartialEq)]
@@ -958,8 +958,18 @@ impl StrategyEngine {
         let volatility = match self.calculate_volatility() {
             Some(vol) => vol * 100.0, // Convert to percentage
             None => {
-                // Fallback to config defaults if can't calculate volatility
-                return (self.config.stop_loss_percent, self.config.take_profit_percent);
+                // ✅ FIX BUG #29: Ensure config fallback is safe
+                let fallback_sl = self.config.stop_loss_percent.max(MIN_SL_PERCENT);
+                let fallback_tp = self.config.take_profit_percent.max(fallback_sl * TP_MULTIPLIER);
+
+                if self.config.stop_loss_percent < MIN_SL_PERCENT {
+                    warn!(
+                        "⚠️  Config SL {:.2}% too low, using minimum {:.2}%",
+                        self.config.stop_loss_percent, MIN_SL_PERCENT
+                    );
+                }
+
+                return (fallback_sl, fallback_tp);
             }
         };
 
@@ -1025,6 +1035,18 @@ impl StrategyEngine {
         // Formula: Position_Size = Risk_Amount / (SL_Percent / 100)
         // Example: SL 1% → Position $30, SL 3% → Position $10 (both risk $0.30)
         const RISK_AMOUNT_USD: f64 = 0.30; // Fixed risk: $0.30 per trade
+
+        // ✅ FIX BUG #29 (CRITICAL): Prevent division by zero
+        if dynamic_sl_percent <= 0.0 {
+            error!(
+                "❌ BUG #29 CAUGHT! Invalid SL percent: {:.4}% (must be > 0)",
+                dynamic_sl_percent
+            );
+            error!("⚠️  Cannot calculate position size with zero/negative SL, aborting entry");
+            self.pending_signal = None;
+            self.confirmation_count = 0;
+            return;
+        }
 
         let sl_decimal = dynamic_sl_percent / 100.0; // Convert to decimal (e.g., 1.5% -> 0.015)
         let risk_adjusted_position_usd = RISK_AMOUNT_USD / sl_decimal;

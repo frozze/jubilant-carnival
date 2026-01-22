@@ -150,21 +150,98 @@ impl ExecutionActor {
         }
 
         // Timeout - order not filled within 10 seconds
-        // ✅ FIX BUG #5: Cancel the orphan order before reporting failure
-        warn!("⏰ Order {} timeout, attempting to cancel...", order_id);
+        // ✅ FIX BUG #20 & #21: CRITICAL race condition!
+        // Between cancel request and response, order might FILL or PARTIALLY FILL
+        // We MUST verify final state before reporting failure
+        warn!("⏰ Order {} timeout after 10s, attempting to cancel...", order_id);
+
         if let Err(e) = self.client.cancel_order(&symbol_str, &order_id).await {
             error!("Failed to cancel timed-out order: {}", e);
         }
 
-        let error_msg = format!("Order {} cancelled after timeout", order_id);
-        error!("❌ {}", error_msg);
+        // ✅ CRITICAL: Query final order status after cancel
+        // The order might have filled DURING the cancel API call!
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await; // Let cancel settle
 
-        if let Err(e) = self
-            .strategy_tx
-            .send(StrategyMessage::OrderFailed(error_msg))
-            .await
-        {
-            error!("Failed to send OrderFailed message: {}", e);
+        match self.client.get_order_status(&symbol_str, &order_id).await {
+            Ok(final_status) => {
+                match final_status.order_status.as_str() {
+                    "Filled" => {
+                        // ✅ Order FILLED during cancel! This is the race condition!
+                        warn!("⚠️  BUG #20 CAUGHT! Order {} filled DURING cancel attempt", order_id);
+                        info!("✅ Order {} FILLED (detected after cancel)", order_id);
+
+                        if let Err(e) = self
+                            .strategy_tx
+                            .send(StrategyMessage::OrderFilled(symbol.clone()))
+                            .await
+                        {
+                            error!("Failed to send OrderFilled message: {}", e);
+                        }
+
+                        // Query position to confirm
+                        self.handle_get_position(symbol).await;
+                        return;
+                    }
+                    "PartiallyFilled" => {
+                        // ✅ BUG #21: Partial fill exists!
+                        warn!("⚠️  BUG #21 CAUGHT! Order {} PARTIALLY filled: {}/{}",
+                              order_id, final_status.cum_exec_qty, final_status.qty);
+
+                        // Query position - partial position exists!
+                        self.handle_get_position(symbol).await;
+
+                        // Notify strategy that partial fill occurred (not a full failure)
+                        let error_msg = format!(
+                            "Order {} partially filled ({}/{}), then cancelled",
+                            order_id, final_status.cum_exec_qty, final_status.qty
+                        );
+                        warn!("{}", error_msg);
+
+                        if let Err(e) = self
+                            .strategy_tx
+                            .send(StrategyMessage::OrderFailed(error_msg))
+                            .await
+                        {
+                            error!("Failed to send OrderFailed message: {}", e);
+                        }
+                        return;
+                    }
+                    "Cancelled" | "Rejected" => {
+                        // Truly cancelled/rejected - safe to report failure
+                        let error_msg = format!("Order {} {} after timeout", order_id, final_status.order_status);
+                        info!("✅ Verified: {}", error_msg);
+
+                        if let Err(e) = self
+                            .strategy_tx
+                            .send(StrategyMessage::OrderFailed(error_msg))
+                            .await
+                        {
+                            error!("Failed to send OrderFailed message: {}", e);
+                        }
+                        return;
+                    }
+                    _ => {
+                        warn!("Unknown final order status: {}", final_status.order_status);
+                    }
+                }
+            }
+            Err(e) => {
+                // ✅ DEFENSIVE: If we can't query status, check position anyway
+                error!("Failed to verify final order status: {}", e);
+                warn!("⚠️  Cannot confirm order state, checking position defensively...");
+                self.handle_get_position(symbol).await;
+
+                // Report failure but position check will reveal truth
+                let error_msg = format!("Order {} cancel attempted, final state unknown", order_id);
+                if let Err(e) = self
+                    .strategy_tx
+                    .send(StrategyMessage::OrderFailed(error_msg))
+                    .await
+                {
+                    error!("Failed to send OrderFailed message: {}", e);
+                }
+            }
         }
     }
 
@@ -259,14 +336,50 @@ impl ExecutionActor {
                                 }
                             }
 
-                            // Timeout - assume filled for Market IOC
-                            warn!("Close order confirmation timeout, assuming filled");
-                            if let Err(e) = self
-                                .strategy_tx
-                                .send(StrategyMessage::PositionUpdate(None))
-                                .await
-                            {
-                                error!("Failed to send PositionUpdate(None): {}", e);
+                            // ✅ FIX BUG #22 (CRITICAL): NEVER assume filled!
+                            // Market orders CAN be rejected (insufficient liquidity, price protection, risk limits)
+                            // If we assume filled but position still exists → Strategy thinks closed → money bleeds!
+                            warn!("⏰ Close order {} timeout after 5s, verifying position state...", response.order_id);
+
+                            // Query final order status
+                            match self.client.get_order_status(&symbol.0, &response.order_id).await {
+                                Ok(final_status) => {
+                                    match final_status.order_status.as_str() {
+                                        "Filled" => {
+                                            info!("✅ Close order {} verified FILLED", response.order_id);
+                                            if let Err(e) = self
+                                                .strategy_tx
+                                                .send(StrategyMessage::PositionUpdate(None))
+                                                .await
+                                            {
+                                                error!("Failed to send PositionUpdate(None): {}", e);
+                                            }
+                                        }
+                                        "PartiallyFilled" => {
+                                            warn!("⚠️  Close order {} PARTIALLY filled: {}/{}",
+                                                  response.order_id, final_status.cum_exec_qty, final_status.qty);
+                                            // Query position - partial position still exists!
+                                            self.handle_get_position(symbol.clone()).await;
+                                        }
+                                        "Cancelled" | "Rejected" => {
+                                            error!("❌ Close order {} {}: POSITION STILL EXISTS!",
+                                                   response.order_id, final_status.order_status);
+                                            // DO NOT send PositionUpdate(None) - position still open!
+                                            // Query position to send correct state
+                                            self.handle_get_position(symbol.clone()).await;
+                                        }
+                                        _ => {
+                                            warn!("Unknown close order status: {}, querying position...", final_status.order_status);
+                                            self.handle_get_position(symbol.clone()).await;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    // ✅ DEFENSIVE: Cannot verify order status → Query position directly
+                                    error!("Failed to verify close order status: {}", e);
+                                    warn!("⚠️  BUG #22 PROTECTION: Querying position to verify close...");
+                                    self.handle_get_position(symbol.clone()).await;
+                                }
                             }
                         }
                         Err(e) => {
@@ -283,79 +396,119 @@ impl ExecutionActor {
     }
 
     async fn handle_get_position(&self, symbol: Symbol) {
-        match self.client.get_position(&symbol.0).await {
-            Ok(positions) => {
-                if positions.is_empty() {
-                    if let Err(e) = self
-                        .strategy_tx
-                        .send(StrategyMessage::PositionUpdate(None))
-                        .await
-                    {
-                        error!("Failed to send PositionUpdate(None): {}", e);
-                    }
-                    return;
-                }
+        // ✅ FIX BUG #23 (HIGH): Empty array ambiguity
+        // API can return empty array due to lag even if position exists!
+        // This is especially dangerous after OrderFilled where we KNOW position should exist.
+        // Solution: Retry 3 times before accepting empty result
+        const MAX_RETRIES: u32 = 3;
+        const RETRY_DELAY_MS: u64 = 200;
 
-                for pos_info in positions {
-                    let size = Decimal::from_str(&pos_info.size).unwrap_or(Decimal::ZERO);
-
-                    if size > Decimal::ZERO {
-                        let entry_price = Decimal::from_str(&pos_info.avg_price)
-                            .unwrap_or(Decimal::ZERO);
-                        let is_long = pos_info.side == "Buy";
-
-                        // ✅ FIX BUG #2: Calculate stop_loss based on config
-                        let sl_percent = Decimal::from_str(&self.config.stop_loss_percent.to_string())
-                            .unwrap_or(Decimal::new(5, 1)); // 0.5% default
-                        let sl_multiplier = Decimal::ONE - (sl_percent / Decimal::from(100));
-                        let sl_multiplier_short = Decimal::ONE + (sl_percent / Decimal::from(100));
-                        
-                        let stop_loss = if is_long {
-                            entry_price * sl_multiplier  // Long: SL below entry
+        for retry_attempt in 0..MAX_RETRIES {
+            match self.client.get_position(&symbol.0).await {
+                Ok(positions) => {
+                    if positions.is_empty() {
+                        if retry_attempt < MAX_RETRIES - 1 {
+                            // Not the last attempt - retry after delay
+                            debug!(
+                                "Position query returned empty (attempt {}/{}), retrying in {}ms...",
+                                retry_attempt + 1, MAX_RETRIES, RETRY_DELAY_MS
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                            continue; // Retry
                         } else {
-                            entry_price * sl_multiplier_short  // Short: SL above entry
-                        };
+                            // Last attempt still empty - accept as no position
+                            info!("✅ Position confirmed empty after {} retries", MAX_RETRIES);
+                            if let Err(e) = self
+                                .strategy_tx
+                                .send(StrategyMessage::PositionUpdate(None))
+                                .await
+                            {
+                                error!("Failed to send PositionUpdate(None): {}", e);
+                            }
+                            return;
+                        }
+                    }
 
-                        let position = Position {
-                            symbol: symbol.clone(),
-                            side: if is_long {
-                                PositionSide::Long
+                    // Process positions (not empty)
+                    for pos_info in positions {
+                        let size = Decimal::from_str(&pos_info.size).unwrap_or(Decimal::ZERO);
+
+                        if size > Decimal::ZERO {
+                            let entry_price = Decimal::from_str(&pos_info.avg_price)
+                                .unwrap_or(Decimal::ZERO);
+                            let is_long = pos_info.side == "Buy";
+
+                            // ✅ FIX BUG #2: Calculate stop_loss based on config
+                            let sl_percent = Decimal::from_str(&self.config.stop_loss_percent.to_string())
+                                .unwrap_or(Decimal::new(5, 1)); // 0.5% default
+                            let sl_multiplier = Decimal::ONE - (sl_percent / Decimal::from(100));
+                            let sl_multiplier_short = Decimal::ONE + (sl_percent / Decimal::from(100));
+
+                            let stop_loss = if is_long {
+                                entry_price * sl_multiplier  // Long: SL below entry
                             } else {
-                                PositionSide::Short
-                            },
-                            size,
-                            entry_price,
-                            current_price: Decimal::from_str(&pos_info.avg_price)
-                                .unwrap_or(Decimal::ZERO),
-                            unrealized_pnl: Decimal::from_str(&pos_info.unrealised_pnl)
-                                .unwrap_or(Decimal::ZERO),
-                            stop_loss: Some(stop_loss),  // ✅ Now properly set!
-                        };
+                                entry_price * sl_multiplier_short  // Short: SL above entry
+                            };
 
-                        debug!("📊 Position created: {:?}, SL: {}", position.side, stop_loss);
+                            let position = Position {
+                                symbol: symbol.clone(),
+                                side: if is_long {
+                                    PositionSide::Long
+                                } else {
+                                    PositionSide::Short
+                                },
+                                size,
+                                entry_price,
+                                current_price: Decimal::from_str(&pos_info.avg_price)
+                                    .unwrap_or(Decimal::ZERO),
+                                unrealized_pnl: Decimal::from_str(&pos_info.unrealised_pnl)
+                                    .unwrap_or(Decimal::ZERO),
+                                stop_loss: Some(stop_loss),  // ✅ Now properly set!
+                            };
 
+                            debug!("📊 Position found: {:?}, SL: {}", position.side, stop_loss);
+
+                            if let Err(e) = self
+                                .strategy_tx
+                                .send(StrategyMessage::PositionUpdate(Some(position)))
+                                .await
+                            {
+                                error!("Failed to send PositionUpdate(Some): {}", e);
+                            }
+
+                            return; // Position found, exit retry loop
+                        }
+                    }
+
+                    // All positions have size=0 (shouldn't happen but handle it)
+                    if retry_attempt < MAX_RETRIES - 1 {
+                        debug!("All positions have size=0, retrying...");
+                        tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                        continue;
+                    } else {
+                        warn!("All positions have size=0 after {} retries", MAX_RETRIES);
                         if let Err(e) = self
                             .strategy_tx
-                            .send(StrategyMessage::PositionUpdate(Some(position)))
+                            .send(StrategyMessage::PositionUpdate(None))
                             .await
                         {
-                            error!("Failed to send PositionUpdate(Some): {}", e);
+                            error!("Failed to send PositionUpdate(None) after loop: {}", e);
                         }
-
                         return;
                     }
                 }
-
-                if let Err(e) = self
-                    .strategy_tx
-                    .send(StrategyMessage::PositionUpdate(None))
-                    .await
-                {
-                    error!("Failed to send PositionUpdate(None) after loop: {}", e);
+                Err(e) => {
+                    if retry_attempt < MAX_RETRIES - 1 {
+                        warn!("Failed to get position (attempt {}/{}): {}, retrying...",
+                              retry_attempt + 1, MAX_RETRIES, e);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                        continue;
+                    } else {
+                        error!("Failed to get position after {} retries: {}", MAX_RETRIES, e);
+                        // Don't send PositionUpdate - we don't know the state!
+                        return;
+                    }
                 }
-            }
-            Err(e) => {
-                error!("Failed to get position: {}", e);
             }
         }
     }

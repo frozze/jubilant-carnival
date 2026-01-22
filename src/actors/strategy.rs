@@ -59,6 +59,10 @@ pub struct StrategyEngine {
     /// Cooldown duration in seconds (configurable)
     trade_cooldown_secs: u64,
 
+    // ✅ FIX INFINITE CLOSE LOOP: Rate limit for close attempts
+    /// When we last sent ClosePosition request
+    last_close_attempt: Option<Instant>,
+
     // ✅ FIX MEMORY LOSS BUG: Store active dynamic risk for current position
     /// Stores (SL%, TP%) calculated for the current active trade
     /// CRITICAL: Must use these values in handle_orderbook, NOT config values!
@@ -101,6 +105,8 @@ impl StrategyEngine {
             // ✅ IMPROVEMENT #3: Trade cooldown (30 seconds)
             last_trade_time: None,
             trade_cooldown_secs: 30,
+            // ✅ FIX INFINITE CLOSE LOOP: Initialize rate limit
+            last_close_attempt: None,
             // ✅ FIX MEMORY LOSS BUG: Initialize dynamic risk storage
             active_dynamic_risk: None,
             // ✅ PERFORMANCE: Initialize VWAP cache
@@ -300,6 +306,12 @@ impl StrategyEngine {
             }
         }
 
+        // ✅ FIX INFINITE CLOSE LOOP: Don't process exit logic if already closing or ordering
+        // CRITICAL: orderbook updates come faster than state transitions, causing spam!
+        if self.state == StrategyState::ClosingPosition || self.state == StrategyState::OrderPending {
+            return;
+        }
+
         // Update current price if we have a position
         if let Some(ref mut position) = self.current_position {
             position.current_price = snapshot.mid_price;
@@ -315,6 +327,14 @@ impl StrategyEngine {
 
             // Check stop loss using dynamic SL target
             if pnl_pct <= -sl_target {
+                // ✅ FIX RATE LIMIT: Don't spam close requests
+                if let Some(last_attempt) = self.last_close_attempt {
+                    if last_attempt.elapsed().as_secs() < 2 {
+                        debug!("⏳ Rate limit: Close attempt throttled (< 2s since last)");
+                        return;
+                    }
+                }
+
                 warn!(
                     "🛑 STOP LOSS triggered for {} at {} (PnL: {:.2}% | Target: -{:.2}% {})",
                     position.symbol,
@@ -326,6 +346,7 @@ impl StrategyEngine {
 
                 // ✅ FIXED: Transition to ClosingPosition state
                 self.state = StrategyState::ClosingPosition;
+                self.last_close_attempt = Some(Instant::now());
 
                 if let Err(e) = self
                     .execution_tx
@@ -344,6 +365,14 @@ impl StrategyEngine {
 
             // Check take profit using dynamic TP target
             if pnl_pct >= tp_target {
+                // ✅ FIX RATE LIMIT: Don't spam close requests
+                if let Some(last_attempt) = self.last_close_attempt {
+                    if last_attempt.elapsed().as_secs() < 2 {
+                        debug!("⏳ Rate limit: Close attempt throttled (< 2s since last)");
+                        return;
+                    }
+                }
+
                 info!(
                     "💰 TAKE PROFIT hit for {} (PnL: {:.2}% | Target: {:.2}% {})",
                     position.symbol,
@@ -354,6 +383,7 @@ impl StrategyEngine {
 
                 // ✅ FIXED: Transition to ClosingPosition state
                 self.state = StrategyState::ClosingPosition;
+                self.last_close_attempt = Some(Instant::now());
 
                 if let Err(e) = self
                     .execution_tx
@@ -407,6 +437,11 @@ impl StrategyEngine {
             self.last_cache_update = self.tick_counter;
         }
 
+        // ✅ FIX INFINITE CLOSE LOOP: Don't process flash crash exit if already closing
+        if self.state == StrategyState::ClosingPosition || self.state == StrategyState::OrderPending {
+            return;
+        }
+
         // ✅ FLASH CRASH PROTECTION: Detect extreme price movements
         // If we have an open position and price moves >5% in 1 second, emergency exit
         if let Some(ref mut position) = self.current_position {
@@ -434,12 +469,21 @@ impl StrategyEngine {
             const FLASH_CRASH_THRESHOLD: f64 = -5.0; // -5% sudden loss
 
             if pnl_pct < FLASH_CRASH_THRESHOLD {
+                // ✅ FIX RATE LIMIT: Don't spam close requests
+                if let Some(last_attempt) = self.last_close_attempt {
+                    if last_attempt.elapsed().as_secs() < 2 {
+                        debug!("⏳ Rate limit: Flash crash close throttled (< 2s since last)");
+                        return;
+                    }
+                }
+
                 warn!(
                     "⚡ FLASH CRASH DETECTED: PnL {:.2}% in <1sec! Emergency exit on {}",
                     pnl_pct, position.symbol
                 );
 
                 self.state = StrategyState::ClosingPosition;
+                self.last_close_attempt = Some(Instant::now());
 
                 if let Err(e) = self
                     .execution_tx

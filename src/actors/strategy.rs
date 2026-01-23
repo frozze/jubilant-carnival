@@ -338,13 +338,29 @@ impl StrategyEngine {
             position.current_price = snapshot.mid_price;
 
             // ✅ FIX CRITICAL BUG #8: Use active dynamic risk for BOTH SL and TP, not position.stop_loss!
-            // CRITICAL: position.stop_loss is set by ExecutionActor using static config value,
-            // but we calculated dynamic SL/TP in execute_entry()!
-            // Using position.should_stop_loss() would check WRONG (static) SL!
             let (sl_target, tp_target) = self.active_dynamic_risk
                 .unwrap_or((self.config.stop_loss_percent, self.config.take_profit_percent));
 
             let pnl_pct = position.pnl_percent();
+
+            // ✅ DEBUG: Log PnL every 5 seconds to catch missed TP/SL
+            static mut LAST_PNL_LOG: Option<std::time::Instant> = None;
+            let should_log = unsafe {
+                match LAST_PNL_LOG {
+                    Some(last) if last.elapsed().as_secs() < 5 => false,
+                    _ => {
+                        LAST_PNL_LOG = Some(std::time::Instant::now());
+                        true
+                    }
+                }
+            };
+            if should_log {
+                info!(
+                    "📊 Position {} | Entry: {} | Current: {} | PnL: {:.2}% | TP: {:.2}% | SL: -{:.2}%",
+                    position.symbol, position.entry_price, position.current_price,
+                    pnl_pct, tp_target, sl_target
+                );
+            }
 
             // Check stop loss using dynamic SL target
             if pnl_pct <= -sl_target {
@@ -952,26 +968,10 @@ impl StrategyEngine {
                    position_value / orderbook.mid_price, qty, specs.qty_step);
         }
 
-        // ✅ MEAN REVERSION: Smart Order Routing for better fills
-        let (order_type, price, time_in_force) = if orderbook.is_liquid() {
-            // Liquid market: Use aggressive IOC market orders
-            info!("📈 Using IOC Market Order (liquid market, spread={:.2}bps)", orderbook.spread_bps);
-            (OrderType::Market, None, TimeInForce::IOC)
-        } else {
-            // Wide spread: Try to capture maker rebate with PostOnly limit
-            info!("📊 Using PostOnly Limit Order (wide spread={:.2}bps)", orderbook.spread_bps);
-            let mut limit_price = match side {
-                OrderSide::Buy => orderbook.best_bid,
-                OrderSide::Sell => orderbook.best_ask,
-            };
-
-            if let Some(ref specs) = self.current_specs {
-                limit_price = specs.round_price(limit_price);
-                debug!("Rounded price to {} (tick_size: {})", limit_price, specs.tick_size);
-            }
-
-            (OrderType::Limit, Some(limit_price), TimeInForce::PostOnly)
-        };
+        // ✅ MEAN REVERSION: Always use Market IOC for reliable fills
+        // PostOnly limits were getting cancelled on fast markets (spread too tight)
+        info!("📈 Using Market IOC Order (spread={:.2}bps)", orderbook.spread_bps);
+        let (order_type, price, time_in_force) = (OrderType::Market, None, TimeInForce::IOC);
 
         // ✅ Pass symbol specs to order for precision validation
         let (qty_step, tick_size) = if let Some(ref specs) = self.current_specs {

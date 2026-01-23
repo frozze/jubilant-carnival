@@ -389,9 +389,11 @@ impl StrategyEngine {
             }
 
             // ✅ TRAILING STOP: For momentum trades, check if price dropped from peak
-            const TRAILING_DISTANCE: f64 = 1.5; // Close if dropped 1.5% from peak
-            if self.is_momentum_trade && self.peak_pnl_percent > 0.5 {
-                // Only activate trailing after 0.5% profit
+            // FIX: Distance 1.5% was too wide for scalping (1.5% price = 15% ROE)
+            // New distance: 0.2% price (~2% ROE) - secures profit quickly
+            const TRAILING_DISTANCE: f64 = 0.2; 
+            if self.is_momentum_trade && self.peak_pnl_percent > 0.3 {
+                // Only activate trailing after 0.3% profit
                 let drop_from_peak = self.peak_pnl_percent - pnl_pct;
                 if drop_from_peak >= TRAILING_DISTANCE {
                     info!(

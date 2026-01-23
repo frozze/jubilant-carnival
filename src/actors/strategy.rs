@@ -623,21 +623,34 @@ impl StrategyEngine {
         if let Some(momentum) = self.calculate_momentum() {
             // Check entry conditions: deviation from VWAP exceeds threshold
             if momentum.abs() > self.momentum_threshold {
-                // ✅ MEAN REVERSION: Inverted signal!
-                // Price ABOVE VWAP (momentum > 0) → expect return DOWN → SHORT
-                // Price BELOW VWAP (momentum < 0) → expect return UP → LONG
-                let signal_is_bullish = momentum < 0.0; // INVERTED!
+                // ✅ ADAPTIVE STRATEGY: Switch based on 24h volatility
+                // |change| < 10% → Mean Reversion (stable coin)
+                // |change| > 10% → Momentum/Trend (pump coin)
+                let is_pump_coin = self.price_change_24h
+                    .map(|pc| pc.abs() > 0.10)
+                    .unwrap_or(false);
 
-                // ✅ FIX BUG #15: Show analysis at INFO level when strong signal detected
-                info!("🔄 Mean reversion signal: Price {:.2}% from VWAP → {} entry",
-                      momentum * 100.0,
-                      if signal_is_bullish { "LONG (expect bounce)" } else { "SHORT (expect pullback)" });
+                let signal_is_bullish = if is_pump_coin {
+                    // MOMENTUM MODE: Trade WITH the trend
+                    // Price ABOVE VWAP → trend is UP → LONG
+                    // Price BELOW VWAP → trend is DOWN → SHORT
+                    momentum > 0.0
+                } else {
+                    // MEAN REVERSION MODE: Trade AGAINST the move  
+                    // Price ABOVE VWAP → expect pullback → SHORT
+                    // Price BELOW VWAP → expect bounce → LONG
+                    momentum < 0.0
+                };
 
-                // ✅ MEAN REVERSION: Skip 24h trend check - we trade against short-term moves
-                // Just log the 24h context for reference
-                if let Some(price_change) = self.price_change_24h {
-                    debug!("📊 24h context: {:.1}% (ignored for mean reversion)", price_change * 100.0);
-                }
+                // Log which strategy mode is active
+                let mode = if is_pump_coin { "MOMENTUM" } else { "MEAN_REVERSION" };
+                let action = if signal_is_bullish { "LONG" } else { "SHORT" };
+                let price_change_str = self.price_change_24h
+                    .map(|pc| format!("{:.1}%", pc * 100.0))
+                    .unwrap_or_else(|| "N/A".to_string());
+
+                info!("🎯 {} mode (24h: {}) | Price {:.2}% from VWAP → {} entry",
+                      mode, price_change_str, momentum * 100.0, action);
 
                 // ✅ MEAN REVERSION: No trend alignment needed - we trade reversals
                 // Just log trend for debugging
@@ -917,13 +930,17 @@ impl StrategyEngine {
             dynamic_tp_percent
         );
 
-        // ✅ MEAN REVERSION: Inverted side!
-        // momentum > 0 = price ABOVE VWAP → expect pullback → SHORT
-        // momentum < 0 = price BELOW VWAP → expect bounce → LONG
-        let side = if momentum < 0.0 {
-            OrderSide::Buy  // Price below VWAP → LONG
+        // ✅ ADAPTIVE STRATEGY: Order side depends on coin type
+        let is_pump_coin = self.price_change_24h
+            .map(|pc| pc.abs() > 0.10)
+            .unwrap_or(false);
+        
+        let side = if is_pump_coin {
+            // MOMENTUM: Trade WITH the trend
+            if momentum > 0.0 { OrderSide::Buy } else { OrderSide::Sell }
         } else {
-            OrderSide::Sell // Price above VWAP → SHORT
+            // MEAN REVERSION: Trade AGAINST the move
+            if momentum < 0.0 { OrderSide::Buy } else { OrderSide::Sell }
         };
 
         // ✅ RISK-ADJUSTED POSITION SIZING (FIXED DOLLAR RISK)

@@ -68,6 +68,12 @@ pub struct StrategyEngine {
     /// CRITICAL: Must use these values in handle_orderbook, NOT config values!
     active_dynamic_risk: Option<(f64, f64)>,
 
+    // ✅ TRAILING STOP: Track peak profit for momentum trades
+    /// Best PnL percentage reached during this trade (for trailing SL)
+    peak_pnl_percent: f64,
+    /// Whether current trade is in Momentum mode (uses trailing stop)
+    is_momentum_trade: bool,
+
     // ✅ PERFORMANCE: Cache VWAP calculations (recalculate only on new tick)
     cached_vwap_short: Option<Decimal>,  // 50-tick VWAP
     cached_vwap_long: Option<Decimal>,   // 200-tick VWAP
@@ -109,6 +115,9 @@ impl StrategyEngine {
             last_close_attempt: None,
             // ✅ FIX MEMORY LOSS BUG: Initialize dynamic risk storage
             active_dynamic_risk: None,
+            // ✅ TRAILING STOP: Initialize tracking fields
+            peak_pnl_percent: 0.0,
+            is_momentum_trade: false,
             // ✅ PERFORMANCE: Initialize VWAP cache
             cached_vwap_short: None,
             cached_vwap_long: None,
@@ -150,6 +159,9 @@ impl StrategyEngine {
                                 self.active_dynamic_risk = None;
                                 // ✅ FIX BUG #18: Clear close attempt timestamp
                                 self.last_close_attempt = None;
+                                // ✅ CLEANUP: Reset trailing stop state
+                                self.is_momentum_trade = false;
+                                self.peak_pnl_percent = 0.0;
                                 self.state = StrategyState::Idle;
                             } else if self.state == StrategyState::SwitchingSymbol {
                                 // ✅ FIX BUG #1: Now complete the pending symbol change
@@ -160,6 +172,9 @@ impl StrategyEngine {
                                 self.active_dynamic_risk = None;
                                 // ✅ FIX BUG #18: Clear close attempt timestamp
                                 self.last_close_attempt = None;
+                                // ✅ CLEANUP: Reset trailing stop state
+                                self.is_momentum_trade = false;
+                                self.peak_pnl_percent = 0.0;
                                 if let Some((new_symbol, specs, price_change_24h)) = self.pending_symbol_change.take() {
                                     self.complete_symbol_switch(new_symbol, specs, price_change_24h);
                                 } else {
@@ -343,6 +358,11 @@ impl StrategyEngine {
 
             let pnl_pct = position.pnl_percent();
 
+            // ✅ TRAILING STOP: Update peak PnL for momentum trades
+            if self.is_momentum_trade && pnl_pct > self.peak_pnl_percent {
+                self.peak_pnl_percent = pnl_pct;
+            }
+
             // ✅ DEBUG: Log PnL every 5 seconds to catch missed TP/SL
             static mut LAST_PNL_LOG: Option<std::time::Instant> = None;
             let should_log = unsafe {
@@ -355,11 +375,42 @@ impl StrategyEngine {
                 }
             };
             if should_log {
+                let mode = if self.is_momentum_trade { "MOMENTUM" } else { "REVERSION" };
+                let trailing_info = if self.is_momentum_trade {
+                    format!(" | Peak: {:.2}%", self.peak_pnl_percent)
+                } else {
+                    String::new()
+                };
                 info!(
-                    "📊 Position {} | Entry: {} | Current: {} | PnL: {:.2}% | TP: {:.2}% | SL: -{:.2}%",
-                    position.symbol, position.entry_price, position.current_price,
-                    pnl_pct, tp_target, sl_target
+                    "📊 {} {} | Entry: {} | Current: {} | PnL: {:.2}% | TP: {:.2}% | SL: -{:.2}%{}",
+                    mode, position.symbol, position.entry_price, position.current_price,
+                    pnl_pct, tp_target, sl_target, trailing_info
                 );
+            }
+
+            // ✅ TRAILING STOP: For momentum trades, check if price dropped from peak
+            const TRAILING_DISTANCE: f64 = 1.5; // Close if dropped 1.5% from peak
+            if self.is_momentum_trade && self.peak_pnl_percent > 0.5 {
+                // Only activate trailing after 0.5% profit
+                let drop_from_peak = self.peak_pnl_percent - pnl_pct;
+                if drop_from_peak >= TRAILING_DISTANCE {
+                    info!(
+                        "📉 TRAILING STOP triggered for {} | Peak: {:.2}% | Now: {:.2}% | Drop: {:.2}%",
+                        position.symbol, self.peak_pnl_percent, pnl_pct, drop_from_peak
+                    );
+                    
+                    self.state = StrategyState::ClosingPosition;
+                    self.last_close_attempt = Some(Instant::now());
+                    
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        self.execution_tx.send(ExecutionMessage::ClosePosition {
+                            symbol: position.symbol.clone(),
+                            position_side: position.side,
+                        })
+                    ).await;
+                    return;
+                }
             }
 
             // Check stop loss using dynamic SL target
@@ -410,7 +461,8 @@ impl StrategyEngine {
             }
 
             // Check take profit using dynamic TP target
-            if pnl_pct >= tp_target {
+            // ✅ TRAILING STOP: For momentum trades, ignore fixed TP and let profit run!
+            if !self.is_momentum_trade && pnl_pct >= tp_target {
                 // ✅ FIX RATE LIMIT: Don't spam close requests
                 if let Some(last_attempt) = self.last_close_attempt {
                     if last_attempt.elapsed().as_secs() < 2 {
@@ -934,6 +986,10 @@ impl StrategyEngine {
         let is_pump_coin = self.price_change_24h
             .map(|pc| pc.abs() > 0.10)
             .unwrap_or(false);
+        
+        // ✅ TRAILING STOP: Activate for momentum trades
+        self.is_momentum_trade = is_pump_coin;
+        self.peak_pnl_percent = 0.0;
         
         let side = if is_pump_coin {
             // MOMENTUM: Trade WITH the trend

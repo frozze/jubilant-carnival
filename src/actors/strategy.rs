@@ -1082,10 +1082,29 @@ impl StrategyEngine {
                    position_value / orderbook.mid_price, qty, specs.qty_step);
         }
 
-        // ✅ MEAN REVERSION: Always use Market IOC for reliable fills
-        // PostOnly limits were getting cancelled on fast markets (spread too tight)
-        info!("📈 Using Market IOC Order (spread={:.2}bps)", orderbook.spread_bps);
-        let (order_type, price, time_in_force) = (OrderType::Market, None, TimeInForce::IOC);
+        // ✅ SMART EXECUTION (Hybrid Mode):
+        // 1. Momentum (Pump): Use MARKET IOC (Speed is king, pay Taker fee)
+        // 2. Mean Reversion (Stable): Use LIMIT POST_ONLY (Cost is king, get Maker rebate)
+        
+        let (order_type, price, time_in_force) = if is_pump_coin {
+            info!("🚀 MOMENTUM MODE: Using MARKET IOC for speed (Taker Fee)");
+            (OrderType::Market, None, TimeInForce::IOC)
+        } else {
+            // Calculate limit price based on side (slightly aggressive to fill)
+            // Buy: Best Ask (taking liquidity? No, PostOnly prevents it) -> Place at Best Bid
+            // Sell: Best Bid -> Place at Best Ask
+            // Actual strategy: Place at Best Bid/Ask to join the queue
+            let limit_price = match side {
+                OrderSide::Buy => orderbook.best_bid,
+                OrderSide::Sell => orderbook.best_ask,
+            };
+            
+            info!(
+                "📉 REVERSION MODE: Using LIMIT POST_ONLY for rebate (Maker Fee) @ {}", 
+                limit_price
+            );
+            (OrderType::Limit, Some(limit_price), TimeInForce::PostOnly)
+        };
 
         // ✅ Pass symbol specs to order for precision validation
         let (qty_step, tick_size) = if let Some(ref specs) = self.current_specs {

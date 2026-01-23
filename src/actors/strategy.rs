@@ -901,11 +901,13 @@ impl StrategyEngine {
             dynamic_tp_percent
         );
 
-        // Determine side
-        let side = if momentum > 0.0 {
-            OrderSide::Buy
+        // ✅ MEAN REVERSION: Inverted side!
+        // momentum > 0 = price ABOVE VWAP → expect pullback → SHORT
+        // momentum < 0 = price BELOW VWAP → expect bounce → LONG
+        let side = if momentum < 0.0 {
+            OrderSide::Buy  // Price below VWAP → LONG
         } else {
-            OrderSide::Sell
+            OrderSide::Sell // Price above VWAP → SHORT
         };
 
         // ✅ RISK-ADJUSTED POSITION SIZING (FIXED DOLLAR RISK)
@@ -950,35 +952,26 @@ impl StrategyEngine {
                    position_value / orderbook.mid_price, qty, specs.qty_step);
         }
 
-        // ⚠️ TEMPORARY: Force Market IOC for testing (1-2 days)
-        // TODO: Revert to smart routing after testing
-        // Smart Order Routing based on liquidity (DISABLED FOR TESTING)
-        let (order_type, price, time_in_force) = {
-            // FORCED: Always use Market IOC for guaranteed execution during testing
-            info!("📈 Using Market IOC (FORCED FOR TESTING - will revert to smart routing later)");
+        // ✅ MEAN REVERSION: Smart Order Routing for better fills
+        let (order_type, price, time_in_force) = if orderbook.is_liquid() {
+            // Liquid market: Use aggressive IOC market orders
+            info!("📈 Using IOC Market Order (liquid market, spread={:.2}bps)", orderbook.spread_bps);
             (OrderType::Market, None, TimeInForce::IOC)
-        };
+        } else {
+            // Wide spread: Try to capture maker rebate with PostOnly limit
+            info!("📊 Using PostOnly Limit Order (wide spread={:.2}bps)", orderbook.spread_bps);
+            let mut limit_price = match side {
+                OrderSide::Buy => orderbook.best_bid,
+                OrderSide::Sell => orderbook.best_ask,
+            };
 
-        // Original smart routing logic (commented out for testing):
-        // let (order_type, price, time_in_force) = if orderbook.is_liquid() {
-        //     // Liquid market: Use aggressive IOC market orders
-        //     info!("📈 Using IOC Market Order (liquid market)");
-        //     (OrderType::Market, None, TimeInForce::IOC)
-        // } else {
-        //     // Wide spread: Try to capture maker rebate with PostOnly limit
-        //     info!("📊 Using PostOnly Limit Order (wide spread)");
-        //     let mut limit_price = match side {
-        //         OrderSide::Buy => orderbook.best_bid,
-        //         OrderSide::Sell => orderbook.best_ask,
-        //     };
-        //
-        //     if let Some(ref specs) = self.current_specs {
-        //         limit_price = specs.round_price(limit_price);
-        //         debug!("Rounded price to {} (tick_size: {})", limit_price, specs.tick_size);
-        //     }
-        //
-        //     (OrderType::Limit, Some(limit_price), TimeInForce::PostOnly)
-        // };
+            if let Some(ref specs) = self.current_specs {
+                limit_price = specs.round_price(limit_price);
+                debug!("Rounded price to {} (tick_size: {})", limit_price, specs.tick_size);
+            }
+
+            (OrderType::Limit, Some(limit_price), TimeInForce::PostOnly)
+        };
 
         // ✅ Pass symbol specs to order for precision validation
         let (qty_step, tick_size) = if let Some(ref specs) = self.current_specs {

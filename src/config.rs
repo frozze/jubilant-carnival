@@ -38,6 +38,9 @@ pub struct Config {
 
     // ✅ MEAN REVERSION: Fixed trading symbol (empty = auto-scan)
     pub trading_symbol: Option<String>,
+
+    // ✅ SCANNER MODE: "STABLE" (default) or "VOLATILE" (Find Mid-Caps)
+    pub scanner_mode: String,
 }
 
 impl Config {
@@ -123,6 +126,11 @@ impl Config {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .map(|s| s.trim().to_uppercase()),
+
+            // ✅ SCANNER MODE: "STABLE" or "VOLATILE"
+            scanner_mode: env::var("SCANNER_MODE")
+                .unwrap_or_else(|_| "STABLE".to_string())
+                .to_uppercase(),
         })
     }
 

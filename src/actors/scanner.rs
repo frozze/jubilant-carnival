@@ -115,13 +115,33 @@ impl ScannerActor {
                     return None;
                 }
 
-                // ✅ MEAN REVERSION FORMULA: Prefer liquid, stable coins
-                // High turnover = good liquidity for fills
-                // Low price change = more predictable mean reversion
-                // Formula: turnover / (|change| + 1) 
-                // Example: $100M / (0.05 + 1) = 95M score (stable coin)
-                //          $100M / (0.30 + 1) = 77M score (pump coin - penalized)
-                let score = turnover_24h / (price_change_24h.abs() + 1.0);
+                // ✅ MEAN REVERSION SCORING:
+                // MODE 1: "STABLE" (Default) - Prefer Stable Coins (SOL, BTC)
+                // Formula: turnover / (|change| + 1) -> Penalizes volatility
+                
+                // MODE 2: "VOLATILE" (Mid-Caps) - Prefer Active Coins (RENDER, SUI)
+                // Formula: turnover * (|change|) -> Rewards volatility
+                // But filter out extreme pumps (>30%) to avoid suicide
+                
+                let score = if self.config.scanner_mode == "VOLATILE" {
+                    // Mid-Cap Logic:
+                    // 1. Must move at least 1.5% (otherwise it's dead)
+                    // 2. Must not move more than 30% (otherwise it's a dangerous pump)
+                    let abs_change = price_change_24h.abs();
+                    
+                    if abs_change < 0.015 {
+                         0.0 // Too stable (Dead)
+                    } else if abs_change > 0.30 {
+                         0.0 // Too volatile (Dangerous Pump)
+                    } else {
+                         // Reward activity: Volume * Volatility
+                         turnover_24h * abs_change
+                    }
+                } else {
+                    // Stable Logic (Old default):
+                    // Penalize volatility. We want liquid coins that don't move much.
+                    turnover_24h / (price_change_24h.abs() + 1.0)
+                };
 
                 Some(ScoredCoin {
                     symbol,

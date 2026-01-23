@@ -35,6 +35,9 @@ pub struct Config {
 
     // ✅ PUMP PROTECTION: Blacklist specific symbols
     pub blacklist_symbols: Vec<String>,
+
+    // ✅ MEAN REVERSION: Fixed trading symbol (empty = auto-scan)
+    pub trading_symbol: Option<String>,
 }
 
 impl Config {
@@ -114,6 +117,12 @@ impl Config {
                 .map(|s| s.trim().to_uppercase())
                 .filter(|s| !s.is_empty())
                 .collect(),
+
+            // ✅ MEAN REVERSION: Fixed symbol (e.g., BTCUSDT). Empty = auto-scan
+            trading_symbol: env::var("TRADING_SYMBOL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().to_uppercase()),
         })
     }
 

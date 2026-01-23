@@ -47,8 +47,10 @@ impl MarketDataActor {
         loop {
             match self.connect_and_stream().await {
                 Ok(_) => {
-                    info!("WebSocket connection closed gracefully");
-                    break;
+                    // ✅ FIX BUG #31: Reconnect after graceful close (e.g., error 104)
+                    warn!("⚠️  WebSocket connection closed, reconnecting in 3s...");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    // Continue loop to reconnect instead of breaking
                 }
                 Err(e) => {
                     error!("WebSocket error: {}. Reconnecting in 5s...", e);

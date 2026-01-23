@@ -62,6 +62,11 @@ impl ScannerActor {
     }
 
     async fn scan_and_select(&mut self) -> Result<()> {
+        // ✅ MEAN REVERSION: If fixed symbol is set, use it directly (no scanning)
+        if let Some(ref fixed_symbol) = self.config.trading_symbol {
+            return self.use_fixed_symbol(fixed_symbol.clone()).await;
+        }
+
         info!("🎯 Starting market scan...");
 
         // Fetch all tickers
@@ -110,8 +115,13 @@ impl ScannerActor {
                     return None;
                 }
 
-                // ✅ PURE FORMULA: Turnover * |PriceChange| (NO BIAS)
-                let score = turnover_24h * price_change_24h.abs();
+                // ✅ MEAN REVERSION FORMULA: Prefer liquid, stable coins
+                // High turnover = good liquidity for fills
+                // Low price change = more predictable mean reversion
+                // Formula: turnover / (|change| + 1) 
+                // Example: $100M / (0.05 + 1) = 95M score (stable coin)
+                //          $100M / (0.30 + 1) = 77M score (pump coin - penalized)
+                let score = turnover_24h / (price_change_24h.abs() + 1.0);
 
                 Some(ScoredCoin {
                     symbol,
@@ -240,6 +250,65 @@ impl ScannerActor {
             warn!("⚠️  No suitable coins found in scan");
         }
 
+        Ok(())
+    }
+
+    /// ✅ MEAN REVERSION: Use fixed trading symbol (skip scanning)
+    async fn use_fixed_symbol(&mut self, symbol: String) -> Result<()> {
+        // Only send on first scan or if symbol changed
+        let should_notify = self.first_scan 
+            || self.current_symbol.as_ref().map(|s| &s.0) != Some(&symbol);
+
+        if !should_notify {
+            debug!("📌 Fixed symbol {} already active", symbol);
+            return Ok(());
+        }
+
+        info!("📌 Using fixed trading symbol: {}", symbol);
+
+        // Fetch instrument specs
+        let specs = match self.client.get_instrument_info(&symbol).await {
+            Ok(info) => {
+                let specs = SymbolSpecs::from(info);
+                self.specs_cache.insert(specs.clone());
+                specs
+            }
+            Err(e) => {
+                error!("Failed to fetch specs for {}: {}", symbol, e);
+                self.specs_cache.get_or_default(&symbol)
+            }
+        };
+
+        // Get 24h price change (default to 0 for neutral)
+        let price_change_24h = self.client.get_tickers("linear").await
+            .ok()
+            .and_then(|t| t.list.iter()
+                .find(|ticker| ticker.symbol == symbol)
+                .and_then(|ticker| ticker.price_24h_pcnt.parse::<f64>().ok()))
+            .unwrap_or(0.0);
+
+        // Send switch command to MarketDataActor
+        if let Err(e) = self.market_data_tx
+            .send(MarketDataMessage::SwitchSymbol(Symbol(symbol.clone())))
+            .await
+        {
+            error!("Failed to send symbol switch: {}", e);
+        }
+
+        // Send to StrategyEngine
+        if let Err(e) = self.strategy_tx
+            .send(StrategyMessage::SymbolChanged {
+                symbol: Symbol(symbol.clone()),
+                specs,
+                price_change_24h,
+            })
+            .await
+        {
+            error!("Failed to send symbol specs: {}", e);
+        }
+
+        self.current_symbol = Some(Symbol(symbol));
+        self.first_scan = false;
         Ok(())
     }
 }

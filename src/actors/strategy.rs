@@ -605,151 +605,29 @@ impl StrategyEngine {
 
         // Calculate momentum
         if let Some(momentum) = self.calculate_momentum() {
-            // Check entry conditions
+            // Check entry conditions: deviation from VWAP exceeds threshold
             if momentum.abs() > self.momentum_threshold {
-                let signal_is_bullish = momentum > 0.0;
+                // ✅ MEAN REVERSION: Inverted signal!
+                // Price ABOVE VWAP (momentum > 0) → expect return DOWN → SHORT
+                // Price BELOW VWAP (momentum < 0) → expect return UP → LONG
+                let signal_is_bullish = momentum < 0.0; // INVERTED!
 
                 // ✅ FIX BUG #15: Show analysis at INFO level when strong signal detected
-                info!("📈 Strong momentum detected: {:.2}% ({}) | Analyzing entry...",
+                info!("🔄 Mean reversion signal: Price {:.2}% from VWAP → {} entry",
                       momentum * 100.0,
-                      if signal_is_bullish { "BULLISH" } else { "BEARISH" });
+                      if signal_is_bullish { "LONG (expect bounce)" } else { "SHORT (expect pullback)" });
 
-                // ✅ PUMP PROTECTION: Global Trend Filter (24h price change)
-                // Prevents "Suicide Shorts" on parabolic pumps and "Suicide Longs" on crashes
-                // ✅ CRITICAL FIX: Block entry if no 24h data available yet
-                let price_change = match self.price_change_24h {
-                    Some(pc) => pc,
-                    None => {
-                        debug!("⏸️ No 24h price data yet, waiting for first SymbolChanged");
-                        self.pending_signal = None;
-                        self.confirmation_count = 0;
-                        return;
-                    }
-                };
-
-                const PUMP_THRESHOLD: f64 = 0.15; // 15% threshold
-
-                // ✅ FIX LOG SPAM: Only warn if we were already confirming this signal
-                // Don't spam on every tick if momentum keeps showing wrong direction
-                if price_change > PUMP_THRESHOLD && !signal_is_bullish {
-                    // Only log warning if we were actively confirming a SHORT signal
-                    if self.pending_signal == Some(false) {
-                        warn!(
-                            "🚫 REJECTED: Attempted SHORT on PUMP coin (+{:.1}% 24h). Only LONG allowed.",
-                            price_change * 100.0
-                        );
-                    }
-                    self.pending_signal = None;
-                    self.confirmation_count = 0;
-                    return;
+                // ✅ MEAN REVERSION: Skip 24h trend check - we trade against short-term moves
+                // Just log the 24h context for reference
+                if let Some(price_change) = self.price_change_24h {
+                    debug!("📊 24h context: {:.1}% (ignored for mean reversion)", price_change * 100.0);
                 }
 
-                if price_change < -PUMP_THRESHOLD && signal_is_bullish {
-                    // Only log warning if we were actively confirming a LONG signal
-                    if self.pending_signal == Some(true) {
-                        warn!(
-                            "🚫 REJECTED: Attempted LONG on DUMP coin ({:.1}% 24h). Only SHORT allowed.",
-                            price_change * 100.0
-                        );
-                    }
-                    self.pending_signal = None;
-                    self.confirmation_count = 0;
-                    return;
-                }
-
-                debug!(
-                    "✅ Global trend check passed: {} signal on {:.1}% 24h",
-                    if signal_is_bullish { "LONG" } else { "SHORT" },
-                    price_change * 100.0
-                );
-
-                // ✅ IMPROVEMENT #2: Trend alignment - check if signal aligns with trend
-                // ✅ CRITICAL FIX: Make trend check MANDATORY (block if None)
-                let trend_bullish = match self.calculate_trend() {
-                    Some(trend) => trend,
-                    None => {
-                        // Should not happen (we have 200 ticks), but if zero volume - block entry
-                        warn!("⚠️ Cannot calculate trend (zero volume?), blocking entry for safety");
-                        self.pending_signal = None;
-                        self.confirmation_count = 0;
-                        return;
-                    }
-                };
-
-                if signal_is_bullish != trend_bullish {
-                    debug!("📉 Signal rejected: {} signal vs {} trend",
-                        if signal_is_bullish { "BULLISH" } else { "BEARISH" },
-                        if trend_bullish { "BULLISH" } else { "BEARISH" }
-                    );
-                    // Reset confirmation on trend mismatch
-                    self.pending_signal = None;
-                    self.confirmation_count = 0;
-                    return;
-                }
-
-                // ✅ TREND STRENGTH FILTER: Check if trend is strong enough
-                // Prevents trading in sideways/choppy markets (50% winrate killer!)
-                let short_vwap = self.get_vwap_short().unwrap_or(Decimal::ZERO);
-                let long_vwap = self.get_vwap_long().unwrap_or(Decimal::ZERO);
-
-                if short_vwap > Decimal::ZERO && long_vwap > Decimal::ZERO {
-                    let trend_strength_dec = (short_vwap - long_vwap).abs() / long_vwap;
-                    let trend_strength = trend_strength_dec.to_f64().unwrap_or(0.0);
-
-                    if trend_strength < self.config.min_trend_strength {
-                        debug!(
-                            "📉 Trend too weak: {:.4}% < {:.4}% (sideways market, skipping)",
-                            trend_strength * 100.0,
-                            self.config.min_trend_strength * 100.0
-                        );
-                        self.pending_signal = None;
-                        self.confirmation_count = 0;
-                        return;
-                    }
-
-                    debug!(
-                        "✅ Trend strength check passed: {:.4}% > {:.4}%",
-                        trend_strength * 100.0,
-                        self.config.min_trend_strength * 100.0
-                    );
-                }
-
-                // ✅ ANTI-FOMO: Symmetric Mean Reversion Filter
-                // Block entries if price is too far from VWAP (buying top / selling bottom)
-                if let Some(vwap_distance) = self.calculate_vwap_distance() {
-                    const MAX_DISTANCE_TO_VWAP: f64 = 0.005; // 0.5% threshold
-
-                    // ✅ FIX LOG SPAM: Only warn if we were already confirming this signal
-                    if signal_is_bullish && vwap_distance > MAX_DISTANCE_TO_VWAP {
-                        // Only log warning if we were actively confirming a LONG signal
-                        if self.pending_signal == Some(true) {
-                            warn!(
-                                "🚫 ANTI-FOMO REJECTED: LONG blocked - price too far ABOVE VWAP (+{:.2}%). Waiting for pullback.",
-                                vwap_distance * 100.0
-                            );
-                        }
-                        self.pending_signal = None;
-                        self.confirmation_count = 0;
-                        return;
-                    }
-
-                    if !signal_is_bullish && vwap_distance < -MAX_DISTANCE_TO_VWAP {
-                        // Only log warning if we were actively confirming a SHORT signal
-                        if self.pending_signal == Some(false) {
-                            warn!(
-                                "🚫 ANTI-FOMO REJECTED: SHORT blocked - price too far BELOW VWAP ({:.2}%). Waiting for bounce.",
-                                vwap_distance * 100.0
-                            );
-                        }
-                        self.pending_signal = None;
-                        self.confirmation_count = 0;
-                        return;
-                    }
-
-                    debug!(
-                        "✅ Anti-FOMO check passed: Price {:.2}% from VWAP (within ±0.5%)",
-                        vwap_distance * 100.0
-                    );
+                // ✅ MEAN REVERSION: No trend alignment needed - we trade reversals
+                // Just log trend for debugging
+                if let Some(trend_bullish) = self.calculate_trend() {
+                    debug!("📊 Current trend: {} (trading against it)",
+                        if trend_bullish { "BULLISH" } else { "BEARISH" });
                 }
 
                 // ✅ IMPROVEMENT #1: Confirmation delay

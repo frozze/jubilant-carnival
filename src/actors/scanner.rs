@@ -171,6 +171,19 @@ impl ScannerActor {
         // Sort by score descending
         candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
 
+        // ✅ DEBUG LOGGING: Show top 5 candidates to understand selection logic
+        info!("🔍 SCANNER REPORT (Mode: {})", self.config.scanner_mode);
+        for (i, coin) in candidates.iter().take(5).enumerate() {
+            info!(
+                "   #{}: {} | Score: {:.0} | Volatility: {:+.2}% | Vol: ${:.0}M",
+                i + 1,
+                coin.symbol,
+                coin.score,
+                coin.price_change_24h * 100.0,
+                coin.turnover_24h / 1_000_000.0
+            );
+        }
+
         // Take top coin
         if let Some(top_coin) = candidates.first() {
             info!(

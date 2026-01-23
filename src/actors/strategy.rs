@@ -359,7 +359,8 @@ impl StrategyEngine {
             let pnl_pct = position.pnl_percent();
 
             // ✅ TRAILING STOP: Update peak PnL for momentum trades
-            if self.is_momentum_trade && pnl_pct > self.peak_pnl_percent {
+            // ✅ NOW: Update for ALL trades (needed for Breakeven protection)
+            if pnl_pct > self.peak_pnl_percent {
                 self.peak_pnl_percent = pnl_pct;
             }
 
@@ -413,6 +414,29 @@ impl StrategyEngine {
                     ).await;
                     return;
                 }
+            }
+
+            // ✅ BREAKEVEN / SECURE PROFIT:
+            // If trade was ever > +0.5% (5% ROE), NEVER let it lose money.
+            // Trigger close if it drops back to +0.1% (covers fees).
+            // This applies to BOTH Momentum and Mean Reversion trades.
+            if self.peak_pnl_percent > 0.5 && pnl_pct < 0.1 {
+                 info!(
+                    "🛡️  BREAKEVEN PROTECT triggered for {} | Peak was: {:.2}% | Now: {:.2}% | Securing profit!",
+                    position.symbol, self.peak_pnl_percent, pnl_pct
+                );
+                
+                self.state = StrategyState::ClosingPosition;
+                self.last_close_attempt = Some(Instant::now());
+                
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    self.execution_tx.send(ExecutionMessage::ClosePosition {
+                        symbol: position.symbol.clone(),
+                        position_side: position.side,
+                    })
+                ).await;
+                return;
             }
 
             // Check stop loss using dynamic SL target

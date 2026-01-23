@@ -236,6 +236,21 @@ impl StrategyEngine {
                             self.pending_signal = None;
                             self.confirmation_count = 0;
                         }
+                        // ✅ HARMONY: Handle live market stats update
+                        StrategyMessage::UpdateMarketStats { symbol, price_change_24h } => {
+                            // Only update if it matches current symbol
+                            if let Some(ref current) = self.current_symbol {
+                                if *current == symbol {
+                                    // Log only if change is significant (to avoid log spam)
+                                    let old_change = self.price_change_24h.unwrap_or(0.0);
+                                    if (old_change - price_change_24h).abs() > 0.05 {
+                                        info!("📊 Market Update for {}: 24h change {:.2}% -> {:.2}%", 
+                                              symbol, old_change * 100.0, price_change_24h * 100.0);
+                                    }
+                                    self.price_change_24h = Some(price_change_24h);
+                                }
+                            }
+                        }
                     }
                 }
 

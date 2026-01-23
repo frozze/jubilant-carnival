@@ -37,6 +37,13 @@ pub enum StrategyMessage {
     OrderFilled(Symbol),
     /// Order placement failed
     OrderFailed(String),
+
+    // ✅ HARMONY: Live update of market stats (e.g. 24h change) without resetting state
+    /// Updates market statistics for the current symbol
+    UpdateMarketStats {
+        symbol: Symbol,
+        price_change_24h: f64,
+    },
 }
 
 #[derive(Debug, Clone)]

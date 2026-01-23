@@ -245,6 +245,23 @@ impl ScannerActor {
                 self.first_scan = false;
             } else {
                 info!("✅ Current coin {} still optimal", self.current_symbol.as_ref().unwrap());
+                
+                // ✅ FIX HARMONY: Even if symbol is same, update stats (price_change_24h)
+                // This prevents "Silent Pump" bug where strategy keeps Mean Reversion mode
+                // while coin pumps +20% during the session!
+                if let Some(ref current) = self.current_symbol {
+                    if let Err(e) = self
+                        .strategy_tx
+                        .send(StrategyMessage::UpdateMarketStats {
+                            symbol: current.clone(),
+                            price_change_24h: top_coin.price_change_24h,
+                        })
+                        .await
+                    {
+                         // Don't error log - channel might be full, not critical if one update is missed
+                         debug!("Failed to send market stats update: {}", e);
+                    }
+                }
             }
         } else {
             warn!("⚠️  No suitable coins found in scan");

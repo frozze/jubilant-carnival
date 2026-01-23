@@ -129,7 +129,10 @@ impl Config {
 
             // ✅ SCANNER MODE: "STABLE" or "VOLATILE"
             scanner_mode: env::var("SCANNER_MODE")
-                .unwrap_or_else(|_| "STABLE".to_string())
+                .map(|s| s.trim().to_string()) // Trim whitespace
+                .ok() // Convert Result to Option
+                .filter(|s| !s.is_empty()) // Filter out empty strings
+                .unwrap_or_else(|| "STABLE".to_string()) // Default to STABLE
                 .to_uppercase(),
         })
     }

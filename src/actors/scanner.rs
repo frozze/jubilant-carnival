@@ -134,8 +134,24 @@ impl ScannerActor {
                     } else if abs_change > 0.30 {
                          0.0 // Too volatile (Dangerous Pump)
                     } else {
-                         // Reward activity: Volume * Volatility
-                         turnover_24h * abs_change
+                         // ✅ BELL CURVE SCORING:
+                         // Reward volatility up to 10% (0.10).
+                         // Penalize volatility above 10%.
+                         // This pushes RIVER (e.g. 25%) down, and RENDER (e.g. 5%) up.
+                         
+                         let volatility_factor = if abs_change > 0.10 {
+                             // Penalty zone: 10% -> 30%
+                             // Higher change = Lower score
+                             0.10 - (abs_change - 0.10) * 2.0 
+                         } else {
+                             // Reward zone: 1.5% -> 10%
+                             abs_change
+                         };
+                         
+                         // Ensure non-negative score
+                         let effective_volatility = volatility_factor.max(0.001);
+                         
+                         turnover_24h * effective_volatility
                     }
                 } else {
                     // Stable Logic (Old default):

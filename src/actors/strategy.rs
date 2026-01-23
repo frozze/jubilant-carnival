@@ -1007,8 +1007,27 @@ impl StrategyEngine {
     }
 
     async fn execute_entry(&mut self, momentum: f64, orderbook: &OrderBookSnapshot) {
-        // ✅ ATR-BASED: Calculate dynamic risk parameters
-        let (dynamic_sl_percent, dynamic_tp_percent) = self.calculate_dynamic_risk();
+        // ✅ ADAPTIVE STRATEGY: Order side depends on coin type
+        let is_pump_coin = self.price_change_24h
+            .map(|pc| pc.abs() > 0.10)
+            .unwrap_or(false);
+
+        // ✅ DUAL-MODE RISK MANAGEMENT:
+        // 1. Momentum (Pump): "Smart Liquidation" - Fixed tight SL (-0.35%).
+        //    Rationale: If a pump stalls (-3.5% ROE), it's likely a trap. Exit immediately.
+        // 2. Mean Reversion (Flat): "Adaptive SL" - Based on Volatility (ATR).
+        //    Rationale: Flat markets have noise. We need to survive the noise to catch the reversion.
+        
+        let (dynamic_sl_percent, dynamic_tp_percent) = if is_pump_coin {
+            let fixed_sl = 0.35; // 0.35% price ~ 3.5% ROE
+            let fixed_tp = 10.0; // Let trailing stop handle the exit, high TP just in case
+            debug!("🚀 MOMENTUM RISK: Using Fixed Tight SL (Smart Liquidation) = -{:.2}%", fixed_sl);
+            (fixed_sl, fixed_tp)
+        } else {
+             // Use existing Adaptive Volatility Logic
+             debug!("📉 REVERSION RISK: Using Adaptive Volatility SL");
+             self.calculate_dynamic_risk()
+        };
 
         // ✅ FIX MEMORY LOSS BUG: Store dynamic risk for this trade
         // CRITICAL: handle_orderbook must use these values, not config!
@@ -1022,11 +1041,6 @@ impl StrategyEngine {
             dynamic_sl_percent,
             dynamic_tp_percent
         );
-
-        // ✅ ADAPTIVE STRATEGY: Order side depends on coin type
-        let is_pump_coin = self.price_change_24h
-            .map(|pc| pc.abs() > 0.10)
-            .unwrap_or(false);
         
         // ✅ TRAILING STOP: Activate for momentum trades
         self.is_momentum_trade = is_pump_coin;

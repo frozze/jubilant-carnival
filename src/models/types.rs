@@ -240,6 +240,7 @@ impl<T: Clone> RingBuffer<T> {
         };
 
         // Create iterator that visits only filled slots in order
+        (0..size)
             .map(move |i| (start_idx + i) % capacity)
             .filter_map(move |idx| self.buffer.get(idx).and_then(|x| x.as_ref()))
     }

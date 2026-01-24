@@ -1312,11 +1312,10 @@ impl StrategyEngine {
     /// ✅ INDICATOR UPDATE: Process closed 1-minute candle
     fn process_candle(&mut self, candle: &CandleBuilder) {
         // Update technical indicators
-        let item = candle.to_data_item();
         // ta crate RSI uses close
-        let rsi_val = self.rsi.next(item.close);
+        let rsi_val = self.rsi.next(candle.close);
         // EfficiencyRatio uses close prices usually (impl Next<f64>)
-        let er_val = self.er.next(item.close);
+        let er_val = self.er.next(candle.close);
 
         // Store values for easy access
         self.last_er = er_val;

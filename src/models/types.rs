@@ -240,9 +240,29 @@ impl<T: Clone> RingBuffer<T> {
         };
 
         // Create iterator that visits only filled slots in order
-        (0..size)
             .map(move |i| (start_idx + i) % capacity)
             .filter_map(move |idx| self.buffer.get(idx).and_then(|x| x.as_ref()))
+    }
+
+    /// ✅ PERFORMANCE: Reverse iterator (newest to oldest)
+    /// Optimized for rolling window calculations (VWAP, etc.) without collecting to Vec
+    pub fn iter_rev(&self) -> impl Iterator<Item = &T> {
+        let capacity = self.capacity;
+        let head = self.head;
+        let size = self.size;
+
+        (0..size).map(move |i| {
+            // head points to next write pos, so head-1 is newest
+            // (head - 1 - i) with wrap around
+            // Standard modulo arithmetic: ((head as isize - 1 - i as isize).rem_euclid(capacity as isize)) as usize
+            // But we can do it with usize logic:
+            if i < head {
+                head - 1 - i
+            } else {
+                capacity - (1 + i - head)
+            }
+        })
+        .filter_map(move |idx| self.buffer.get(idx).and_then(|x| x.as_ref()))
     }
 
     pub fn len(&self) -> usize {

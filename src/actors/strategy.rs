@@ -1,5 +1,5 @@
 use crate::actors::messages::{ExecutionMessage, StrategyMessage};
-use crate::config::Config;
+use crate::config::{Config, TradingMode};
 use crate::exchange::SymbolSpecs;
 use crate::models::*;
 use rust_decimal::Decimal;
@@ -8,49 +8,6 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration, Instant};
 use tracing::{debug, error, info, warn};
-use ta::indicators::{EfficiencyRatio, RelativeStrengthIndex};
-use ta::{DataItem, Next};
-
-/// ✅ HELPER: Aggregate ticks into 1-minute candles for ADX/RSI
-#[derive(Debug, Clone)]
-struct CandleBuilder {
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
-    volume: f64,
-    start_time: i64, // Unix timestamp (seconds) of the minute start
-}
-
-impl CandleBuilder {
-    fn new(timestamp: i64, price: f64, size: f64) -> Self {
-        Self {
-            open: price,
-            high: price,
-            low: price,
-            close: price,
-            volume: size,
-            start_time: (timestamp / 1000) / 60 * 60, // Align to minute start (assuming ms timestamp)
-        }
-    }
-
-    fn update(&mut self, price: f64, size: f64) {
-        if price > self.high { self.high = price; }
-        if price < self.low { self.low = price; }
-        self.close = price;
-        self.volume += size;
-    }
-
-    fn to_data_item(&self) -> DataItem {
-        DataItem::builder()
-            .high(self.high)
-            .low(self.low)
-            .close(self.close)
-            .volume(self.volume)
-            .build()
-            .unwrap()
-    }
-}
 
 /// ✅ FIXED: Proper state machine for order lifecycle
 #[derive(Debug, Clone, PartialEq)]
@@ -126,18 +83,8 @@ pub struct StrategyEngine {
     /// invalidation would STOP working after 300 ticks!
     tick_counter: usize,                 // Total ticks processed (never resets)
     last_cache_update: usize,            // tick_counter when cache was last updated
-
-    // ✅ INDICATORS (New)
-    rsi: RelativeStrengthIndex,
-    er: EfficiencyRatio,
-    candle_builder: Option<CandleBuilder>,
     
-    // ✅ MARKET REGIME (New)
-    is_trending: bool,
-    last_rsi: f64,
-    last_er: f64,
-    
-    // ✅ TIME-BASED EXIT (New)
+    // ✅ TIME-BASED EXIT
     position_start_time: Option<Instant>,
 }
 
@@ -180,14 +127,6 @@ impl StrategyEngine {
             cached_volatility: None,
             tick_counter: 0,
             last_cache_update: 0,
-            
-            // ✅ Initialize Indicators
-            rsi: RelativeStrengthIndex::new(14).unwrap(), // Standard 14 periods
-            er: EfficiencyRatio::new(14).unwrap(), // KAMA default 10, ER standard 14? Let's use 14.
-            candle_builder: None,
-            is_trending: false,
-            last_rsi: 50.0,
-            last_er: 0.0,
             position_start_time: None,
         }
     }
@@ -414,14 +353,6 @@ impl StrategyEngine {
         self.cached_volatility = None;
         self.tick_counter = 0;
         self.last_cache_update = 0;
-        
-        // ✅ RESET INDICATORS
-        self.rsi = RelativeStrengthIndex::new(14).unwrap();
-        self.er = EfficiencyRatio::new(14).unwrap();
-        self.candle_builder = None;
-        self.is_trending = false;
-        self.last_rsi = 50.0;
-        self.last_er = 0.0;
     }
 
     async fn handle_orderbook(&mut self, snapshot: OrderBookSnapshot) {
@@ -664,29 +595,7 @@ impl StrategyEngine {
             self.last_cache_update = self.tick_counter;
         }
 
-        // ✅ BUILD CANDLES & UPDATE INDICATORS
-        let price = tick.price.to_f64().unwrap_or(0.0);
-        let size = tick.size.to_f64().unwrap_or(0.0);
-        let timestamp = tick.timestamp; // ms
 
-        match self.candle_builder {
-            Some(ref mut builder) => {
-                let current_minute = (timestamp / 1000) / 60 * 60;
-                if current_minute > builder.start_time {
-                     // Candle closed
-                     let closed_candle = builder.clone();
-                     self.process_candle(&closed_candle);
-
-                     // Start new candle
-                     *self.candle_builder.as_mut().unwrap() = CandleBuilder::new(timestamp, price, size);
-                } else {
-                     builder.update(price, size);
-                }
-            },
-            None => {
-                self.candle_builder = Some(CandleBuilder::new(timestamp, price, size));
-            }
-        }
 
         // ✅ FIX INFINITE CLOSE LOOP: Don't process flash crash exit if already closing
         if self.state == StrategyState::ClosingPosition || self.state == StrategyState::OrderPending {
@@ -844,29 +753,11 @@ impl StrategyEngine {
             let dynamic_threshold = self.momentum_threshold * multiplier;
 
             if momentum.abs() > dynamic_threshold {
-                // ✅ ADAPTIVE STRATEGY: Switch based on MARKET REGIME (ADX)
-                let is_pump_coin = self.is_trending;
+                // ✅ FIXED: Use static config mode instead of dynamic is_trending
+                // CRITICAL: Mode stays constant during bot runtime - no mid-trade switches!
+                let is_momentum_mode = self.config.trading_mode == TradingMode::Momentum;
 
-                // ✅ RSI FILTER: Filter weak signals in Mean Reversion mode
-                if !is_pump_coin {
-                    // Mean Reversion: Only trade extremes
-                    if momentum > 0.0 && self.last_rsi < 55.0 {
-                        // Price > VWAP (Overbought?) -> Want to SHORT, but RSI not high enough
-                        // debug!("⚠️ RSI Filter: Blocked SHORT (RSI {:.2} < 55)", self.last_rsi);
-                        // return; 
-                        // COMMENTED OUT FOR NOW to verify basic logic first, or keep generic? 
-                        // Actually let's trust the plan.
-                    }
-                    if momentum < 0.0 && self.last_rsi > 45.0 {
-                        // Price < VWAP (Oversold?) -> Want to LONG, but RSI not low enough
-                        return;
-                    }
-                    if momentum > 0.0 && self.last_rsi < 55.0 {
-                        return;
-                    }
-                }
-
-                let signal_is_bullish = if is_pump_coin {
+                let signal_is_bullish = if is_momentum_mode {
                     // MOMENTUM MODE: Trade WITH the trend
                     // Price ABOVE VWAP → trend is UP → LONG
                     // Price BELOW VWAP → trend is DOWN → SHORT
@@ -879,20 +770,14 @@ impl StrategyEngine {
                 };
 
                 // Log which strategy mode is active
-                let mode = if is_pump_coin { "MOMENTUM" } else { "MEAN_REVERSION" };
+                let mode = if is_momentum_mode { "MOMENTUM" } else { "MEAN_REVERSION" };
                 let action = if signal_is_bullish { "LONG" } else { "SHORT" };
                 let price_change_str = self.price_change_24h
                     .map(|pc| format!("{:.1}%", pc * 100.0))
                     .unwrap_or_else(|| "N/A".to_string());
-                
-                let extra_info = if !is_pump_coin {
-                    format!(" | RSI: {:.2}", self.last_rsi)
-                } else {
-                    String::new()
-                };
 
-                info!("🎯 {} mode (ER: {:.2}{}) | Price {:.2}% from VWAP → {} entry",
-                      mode, self.last_er, extra_info, momentum * 100.0, action);
+                info!("🎯 {} mode | Price {:.2}% from VWAP | 24h: {} → {} entry",
+                      mode, momentum * 100.0, price_change_str, action);
 
                 // ✅ MEAN REVERSION: No trend alignment needed - we trade reversals
                 // Just log trend for debugging
@@ -1159,8 +1044,8 @@ impl StrategyEngine {
     }
 
     async fn execute_entry(&mut self, momentum: f64, orderbook: &OrderBookSnapshot) {
-        // ✅ ADAPTIVE STRATEGY: Order side depends on MARKET REGIME (ADX)
-        let is_pump_coin = self.is_trending;
+        // ✅ FIXED: Use static config mode instead of dynamic is_trending
+        let is_momentum_mode = self.config.trading_mode == TradingMode::Momentum;
 
         // ✅ DUAL-MODE RISK MANAGEMENT:
         // 1. Momentum (Pump): "Smart Liquidation" - Fixed tight SL (-0.35%).
@@ -1168,7 +1053,7 @@ impl StrategyEngine {
         // 2. Mean Reversion (Flat): "Adaptive SL" - Based on Volatility (ATR).
         //    Rationale: Flat markets have noise. We need to survive the noise to catch the reversion.
         
-        let (dynamic_sl_percent, dynamic_tp_percent) = if is_pump_coin {
+        let (dynamic_sl_percent, dynamic_tp_percent) = if is_momentum_mode {
             let fixed_sl = 0.35; // 0.35% price ~ 3.5% ROE
             let fixed_tp = 10.0; // Let trailing stop handle the exit, high TP just in case
             debug!("🚀 MOMENTUM RISK: Using Fixed Tight SL (Smart Liquidation) = -{:.2}%", fixed_sl);
@@ -1193,10 +1078,10 @@ impl StrategyEngine {
         );
         
         // ✅ TRAILING STOP: Activate for momentum trades
-        self.is_momentum_trade = is_pump_coin;
+        self.is_momentum_trade = is_momentum_mode;
         self.peak_pnl_percent = 0.0;
         
-        let side = if is_pump_coin {
+        let side = if is_momentum_mode {
             // MOMENTUM: Trade WITH the trend
             if momentum > 0.0 { OrderSide::Buy } else { OrderSide::Sell }
         } else {
@@ -1250,7 +1135,7 @@ impl StrategyEngine {
         // 1. Momentum (Pump): Use MARKET IOC (Speed is king, pay Taker fee)
         // 2. Mean Reversion (Stable): Use LIMIT POST_ONLY (Cost is king, get Maker rebate)
         
-        let (order_type, price, time_in_force) = if is_pump_coin {
+        let (order_type, price, time_in_force) = if is_momentum_mode {
             info!("🚀 MOMENTUM MODE: Using MARKET IOC for speed (Taker Fee)");
             (OrderType::Market, None, TimeInForce::IOC)
         } else {
@@ -1306,38 +1191,6 @@ impl StrategyEngine {
             self.active_dynamic_risk = None;
             // Revert state if send failed
             self.state = StrategyState::Idle;
-        }
-    }
-
-    /// ✅ INDICATOR UPDATE: Process closed 1-minute candle
-    fn process_candle(&mut self, candle: &CandleBuilder) {
-        // Update technical indicators
-        // ta crate RSI uses close
-        let rsi_val = self.rsi.next(candle.close);
-        // EfficiencyRatio uses close prices usually (impl Next<f64>)
-        let er_val = self.er.next(candle.close);
-
-        // Store values for easy access
-        self.last_er = er_val;
-        self.last_rsi = rsi_val;
-
-        // ✅ MARKET REGIME UPDATE
-        // Efficiency Ratio > 0.30 indicates a trend
-        let old_regime = self.is_trending;
-        self.is_trending = er_val > 0.30;
-
-        if self.is_trending != old_regime {
-            info!("🔄 Market Regime Changed: {} -> {} (ER: {:.2})", 
-                  if old_regime { "TRENDING" } else { "RANGING" },
-                  if self.is_trending { "TRENDING" } else { "RANGING" },
-                  er_val
-            );
-        }
-
-        // Log stats occasionally (every 5 mins roughly)
-        if candle.start_time % 300 == 0 {
-            info!("📊 Indicators | ER: {:.2} | RSI: {:.2} | Trend: {}", 
-                  er_val, rsi_val, self.is_trending);
         }
     }
 

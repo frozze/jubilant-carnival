@@ -5,8 +5,11 @@ use crate::models::Symbol;
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, Instant};
 use tracing::{debug, error, info, warn};
+
+/// Minimum time to hold a symbol before switching (prevents frequent switches)
+const MIN_SYMBOL_HOLD_TIME_SECS: u64 = 300; // 5 minutes
 
 /// The "Predator" Scanner - hunts for high-volatility coins
 pub struct ScannerActor {
@@ -19,6 +22,8 @@ pub struct ScannerActor {
     current_score: f64,
     // ✅ FIX RECONNECT: Track first scan to ensure subscription after restart
     first_scan: bool,
+    // ✅ STABILITY: Track last symbol switch time
+    last_symbol_switch: Option<Instant>,
 }
 
 impl ScannerActor {
@@ -37,6 +42,7 @@ impl ScannerActor {
             current_symbol: None,
             current_score: 0.0,
             first_scan: true, // ✅ FIX RECONNECT: Ensure first scan always sends messages
+            last_symbol_switch: None,
         }
     }
 
@@ -134,21 +140,16 @@ impl ScannerActor {
                     } else if abs_change > 0.30 {
                          0.0 // Too volatile (Dangerous Pump)
                     } else {
-                         // ✅ BELL CURVE SCORING (TIGHTENED):
-                         // Peak at 5% volatility (ideal Mid-Cap range: 3-7%).
-                         // Penalty above 5% to push RIVER (7-10%) down.
+                         // ✅ FIXED: Bell curve formula
+                         // Peak at 9% volatility (ideal for momentum trading)
+                         // Rewards 5-12% range, penalizes extremes
+                         let optimal = 0.09; // 9% sweet spot
+                         let distance = (abs_change - optimal).abs();
+                         // Score factor: 1.0 at optimal, decreases with distance
+                         let score_factor = 1.0 - (distance / optimal).min(1.0);
                          
-                         let volatility_factor = if abs_change > 0.05 {
-                             // Penalty zone: 5% -> 30%
-                             // Steeper penalty: 3x multiplier
-                             let penalty = (abs_change - 0.05) * 3.0;
-                             (0.05 - penalty).max(0.001) // Ensure non-negative
-                         } else {
-                             // Reward zone: 1.5% -> 5%
-                             abs_change
-                         };
-                         
-                         turnover_24h * volatility_factor
+                         // Final score: volume * volatility * quality
+                         turnover_24h * abs_change * score_factor
                     }
                 } else {
                     // Stable Logic (Old default):
@@ -207,10 +208,25 @@ impl ScannerActor {
 
             // Check if we should switch
             let should_switch = if let Some(ref current) = self.current_symbol {
-                // Switch if new score is significantly higher (threshold multiplier)
-                // Compare against LIVE score, not stale score
-                top_coin.score > self.current_score * self.config.score_threshold_multiplier
-                    && top_coin.symbol != current.0
+                // ✅ STABILITY: Don't switch if we just switched recently
+                let hold_time_ok = self.last_symbol_switch
+                    .map(|t| t.elapsed().as_secs() >= MIN_SYMBOL_HOLD_TIME_SECS)
+                    .unwrap_or(true); // No previous switch = OK to switch
+                
+                if !hold_time_ok {
+                    if let Some(last_switch) = self.last_symbol_switch {
+                        debug!(
+                            "⏳ Symbol hold time: {}s / {}s remaining",
+                            last_switch.elapsed().as_secs(),
+                            MIN_SYMBOL_HOLD_TIME_SECS - last_switch.elapsed().as_secs()
+                        );
+                    }
+                    false
+                } else {
+                    // Hold time OK, check score threshold
+                    top_coin.score > self.current_score * self.config.score_threshold_multiplier
+                        && top_coin.symbol != current.0
+                }
             } else {
                 // No current symbol, switch to top
                 true
@@ -246,6 +262,7 @@ impl ScannerActor {
 
                     self.current_symbol = Some(Symbol(top_coin.symbol.clone()));
                     self.current_score = top_coin.score;
+                    self.last_symbol_switch = Some(Instant::now()); // ✅ Track switch time
 
                     // Send switch command to MarketDataActor (only on actual switch)
                     if let Err(e) = self

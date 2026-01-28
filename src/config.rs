@@ -2,6 +2,29 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::env;
 
+/// Trading strategy mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum TradingMode {
+    /// Momentum: Trade WITH the trend (pump coins, strong directional moves)
+    Momentum,
+    /// Mean Reversion: Trade AGAINST the move (stable coins, expect bounce/pullback)
+    MeanReversion,
+}
+
+impl TradingMode {
+    pub fn from_str(s: &str) -> Result<Self> {
+        match s.to_uppercase().as_str() {
+            "MOMENTUM" => Ok(TradingMode::Momentum),
+            "MEAN_REVERSION" | "MEANREVERSION" | "REVERSION" => Ok(TradingMode::MeanReversion),
+            _ => Err(anyhow::anyhow!(
+                "Invalid TRADING_MODE: '{}'. Must be 'MOMENTUM' or 'MEAN_REVERSION'",
+                s
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub bybit_api_key: String,
@@ -41,6 +64,9 @@ pub struct Config {
 
     // ✅ SCANNER MODE: "STABLE" (default) or "VOLATILE" (Find Mid-Caps)
     pub scanner_mode: String,
+
+    // ✅ NEW: Trading strategy mode (cannot change during runtime!)
+    pub trading_mode: TradingMode,
 }
 
 impl Config {
@@ -134,6 +160,12 @@ impl Config {
                 .filter(|s| !s.is_empty()) // Filter out empty strings
                 .unwrap_or_else(|| "STABLE".to_string()) // Default to STABLE
                 .to_uppercase(),
+
+            // ✅ TRADING MODE: MOMENTUM or MEAN_REVERSION (default: MOMENTUM)
+            trading_mode: env::var("TRADING_MODE")
+                .ok()
+                .and_then(|s| TradingMode::from_str(&s).ok())
+                .unwrap_or(TradingMode::Momentum),
         })
     }
 

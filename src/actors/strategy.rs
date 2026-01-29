@@ -1,5 +1,5 @@
 use crate::actors::messages::{ExecutionMessage, StrategyMessage};
-use crate::config::{Config, TradingMode};
+use crate::config::Config;
 use crate::exchange::SymbolSpecs;
 use crate::models::*;
 use rust_decimal::Decimal;
@@ -753,36 +753,26 @@ impl StrategyEngine {
             let dynamic_threshold = self.momentum_threshold * multiplier;
 
             if momentum.abs() > dynamic_threshold {
-                // ✅ FIXED: Use static config mode instead of dynamic is_trending
-                // CRITICAL: Mode stays constant during bot runtime - no mid-trade switches!
-                let is_momentum_mode = self.config.trading_mode == TradingMode::Momentum;
+                // ⚡ PHASE 1 STABILIZATION: MOMENTUM ONLY
+                // Removed MeanReversion - too complex, contradicts Momentum logic
+                // Simple and fast: Trade WITH the trend
+                
+                let signal_is_bullish = momentum > 0.0;
+                // Price ABOVE VWAP → LONG
+                // Price BELOW VWAP → SHORT
 
-                let signal_is_bullish = if is_momentum_mode {
-                    // MOMENTUM MODE: Trade WITH the trend
-                    // Price ABOVE VWAP → trend is UP → LONG
-                    // Price BELOW VWAP → trend is DOWN → SHORT
-                    momentum > 0.0
-                } else {
-                    // MEAN REVERSION MODE: Trade AGAINST the move  
-                    // Price ABOVE VWAP → expect pullback → SHORT
-                    // Price BELOW VWAP → expect bounce → LONG
-                    momentum < 0.0
-                };
-
-                // Log which strategy mode is active
-                let mode = if is_momentum_mode { "MOMENTUM" } else { "MEAN_REVERSION" };
+                // Log entry signal
                 let action = if signal_is_bullish { "LONG" } else { "SHORT" };
                 let price_change_str = self.price_change_24h
                     .map(|pc| format!("{:.1}%", pc * 100.0))
                     .unwrap_or_else(|| "N/A".to_string());
 
-                info!("🎯 {} mode | Price {:.2}% from VWAP | 24h: {} → {} entry",
-                      mode, momentum * 100.0, price_change_str, action);
+                info!("🎯 MOMENTUM | Price {:.2}% from VWAP | 24h: {} → {} entry",
+                      momentum * 100.0, price_change_str, action);
 
-                // ✅ MEAN REVERSION: No trend alignment needed - we trade reversals
-                // Just log trend for debugging
+                // ✅ MOMENTUM: Trade with the trend
                 if let Some(trend_bullish) = self.calculate_trend() {
-                    debug!("📊 Current trend: {} (trading against it)",
+                    debug!("📊 Current trend: {}",
                         if trend_bullish { "BULLISH" } else { "BEARISH" });
                 }
 
@@ -793,8 +783,9 @@ impl StrategyEngine {
                         self.confirmation_count += 1;
                         debug!("🔄 Signal confirmation: {}/12", self.confirmation_count);
 
-                        // ✅ STRICTER: Need 12 consecutive confirmations (was 3)
-                        if self.confirmation_count >= 12 {
+                        // ⚡ PHASE 1: Reduced from 12 to 3 for faster reaction
+                        // HFT needs speed - 12 ticks = movement already over!
+                        if self.confirmation_count >= 3 {
                             if let Some(ref orderbook) = self.last_orderbook {
                                 // Check spread is reasonable
                                 if orderbook.spread_bps > self.config.max_spread_bps {
@@ -1044,62 +1035,64 @@ impl StrategyEngine {
     }
 
     async fn execute_entry(&mut self, momentum: f64, orderbook: &OrderBookSnapshot) {
-        // ✅ FIXED: Use static config mode instead of dynamic is_trending
-        let is_momentum_mode = self.config.trading_mode == TradingMode::Momentum;
-
-        // ✅ DUAL-MODE RISK MANAGEMENT:
-        // 1. Momentum (Pump): "Smart Liquidation" - Fixed tight SL (-0.35%).
-        //    Rationale: If a pump stalls (-3.5% ROE), it's likely a trap. Exit immediately.
-        // 2. Mean Reversion (Flat): "Adaptive SL" - Based on Volatility (ATR).
-        //    Rationale: Flat markets have noise. We need to survive the noise to catch the reversion.
+        // ⚡ PHASE 1: FIXED RISK - Predictable and simple
+        // Problem: Dynamic SL (0.7-3.0%) made risk uncontrollable
+        // Solution: Fixed tight SL for Momentum scalping
         
-        let (dynamic_sl_percent, dynamic_tp_percent) = if is_momentum_mode {
-            let fixed_sl = 0.35; // 0.35% price ~ 3.5% ROE
-            let fixed_tp = 10.0; // Let trailing stop handle the exit, high TP just in case
-            debug!("🚀 MOMENTUM RISK: Using Fixed Tight SL (Smart Liquidation) = -{:.2}%", fixed_sl);
-            (fixed_sl, fixed_tp)
-        } else {
-             // Use existing Adaptive Volatility Logic
-             debug!("📉 REVERSION RISK: Using Adaptive Volatility SL");
-             self.calculate_dynamic_risk()
-        };
-
+        let (sl_percent, tp_percent) = (0.35, 0.70); // 1:2 R/R ratio
+        info!("🎯 MOMENTUM: Fixed SL={:.2}% TP={:.2}% (1:2 R/R)", sl_percent, tp_percent);
+        
+        // ⚡ PHASE 1: Basic liquidity check via bid/ask sizes
+        // OrderBookSnapshot has bid_size and ask_size
+        let bid_volume_usd = (orderbook.bid_size * orderbook.best_bid).to_f64().unwrap_or(0.0);
+        let ask_volume_usd = (orderbook.ask_size * orderbook.best_ask).to_f64().unwrap_or(0.0);
+        
+        const MIN_SIZE_USD: f64 = 1000.0; // $1k minimum on best level
+        
+       if bid_volume_usd < MIN_SIZE_USD || ask_volume_usd < MIN_SIZE_USD {
+            warn!(
+                "❌ Entry blocked: Low liquidity | Bid: ${:.0} | Ask: ${:.0}",
+                bid_volume_usd, ask_volume_usd
+            );
+            self.pending_signal = None;
+            self.confirmation_count = 0;
+            return;
+        }
+        
         // ✅ FIX MEMORY LOSS BUG: Store dynamic risk for this trade
         // CRITICAL: handle_orderbook must use these values, not config!
-        self.active_dynamic_risk = Some((dynamic_sl_percent, dynamic_tp_percent));
+        self.active_dynamic_risk = Some((sl_percent, tp_percent));
 
         info!(
             "🎯 ENTRY SIGNAL: {} momentum={:.4}% spread={:.2}bps | Dynamic SL={:.2}% TP={:.2}%",
             orderbook.symbol,
             momentum * 100.0,
             orderbook.spread_bps,
-            dynamic_sl_percent,
-            dynamic_tp_percent
+            sl_percent,
+            tp_percent
         );
         
         // ✅ TRAILING STOP: Activate for momentum trades
-        self.is_momentum_trade = is_momentum_mode;
+        self.is_momentum_trade = true; // Always true in Momentum-only mode
         self.peak_pnl_percent = 0.0;
         
-        let side = if is_momentum_mode {
-            // MOMENTUM: Trade WITH the trend
-            if momentum > 0.0 { OrderSide::Buy } else { OrderSide::Sell }
+        // ⚡ MOMENTUM: Trade WITH the trend (simple and clear)
+        let side = if momentum > 0.0 {
+            OrderSide::Buy  // Price > VWAP → LONG
         } else {
-            // MEAN REVERSION: Trade AGAINST the move
-            if momentum < 0.0 { OrderSide::Buy } else { OrderSide::Sell }
+            OrderSide::Sell // Price < VWAP → SHORT
         };
 
         // ✅ RISK-ADJUSTED POSITION SIZING (FIXED DOLLAR RISK)
         // Goal: Lose exactly $X regardless of SL size or volatility
         // Formula: Position_Size = Risk_Amount / (SL_Percent / 100)
-        // Example: SL 1% → Position $30, SL 3% → Position $10 (both risk $0.30)
         let risk_amount_usd = self.config.risk_amount_usd;
 
         // ✅ FIX BUG #29 (CRITICAL): Prevent division by zero
-        if dynamic_sl_percent <= 0.0 {
+        if sl_percent <= 0.0 {
             error!(
                 "❌ BUG #29 CAUGHT! Invalid SL percent: {:.4}% (must be > 0)",
-                dynamic_sl_percent
+                sl_percent
             );
             error!("⚠️  Cannot calculate position size with zero/negative SL, aborting entry");
             self.pending_signal = None;
@@ -1107,7 +1100,7 @@ impl StrategyEngine {
             return;
         }
 
-        let sl_decimal = dynamic_sl_percent / 100.0; // Convert to decimal (e.g., 1.5% -> 0.015)
+        let sl_decimal = sl_percent / 100.0; // Convert to decimal (e.g., 0.35% -> 0.0035)
         let risk_adjusted_position_usd = risk_amount_usd / sl_decimal;
 
         // Cap at max_position_size_usd for safety
@@ -1116,7 +1109,7 @@ impl StrategyEngine {
 
         debug!(
             "💰 Position Sizing: Risk=${:.2}, SL={:.2}%, Calculated=${:.2}, Capped=${:.2}",
-            risk_amount_usd, dynamic_sl_percent, risk_adjusted_position_usd, final_position_usd
+            risk_amount_usd, sl_percent, risk_adjusted_position_usd, final_position_usd
         );
 
         let position_value = Decimal::from_str_exact(&final_position_usd.to_string())
@@ -1131,29 +1124,10 @@ impl StrategyEngine {
                    position_value / orderbook.mid_price, qty, specs.qty_step);
         }
 
-        // ✅ SMART EXECUTION (Hybrid Mode):
-        // 1. Momentum (Pump): Use MARKET IOC (Speed is king, pay Taker fee)
-        // 2. Mean Reversion (Stable): Use LIMIT POST_ONLY (Cost is king, get Maker rebate)
-        
-        let (order_type, price, time_in_force) = if is_momentum_mode {
-            info!("🚀 MOMENTUM MODE: Using MARKET IOC for speed (Taker Fee)");
-            (OrderType::Market, None, TimeInForce::IOC)
-        } else {
-            // Calculate limit price based on side (slightly aggressive to fill)
-            // Buy: Best Ask (taking liquidity? No, PostOnly prevents it) -> Place at Best Bid
-            // Sell: Best Bid -> Place at Best Ask
-            // Actual strategy: Place at Best Bid/Ask to join the queue
-            let limit_price = match side {
-                OrderSide::Buy => orderbook.best_bid,
-                OrderSide::Sell => orderbook.best_ask,
-            };
-            
-            info!(
-                "📉 REVERSION MODE: Using LIMIT POST_ONLY for rebate (Maker Fee) @ {}", 
-                limit_price
-            );
-            (OrderType::Limit, Some(limit_price), TimeInForce::PostOnly)
-        };
+        // ⚡ PHASE 1: MOMENTUM ONLY - Market IOC for speed
+        // Speed is king in HFT scalping
+        info!("🚀 MOMENTUM: Using MARKET IOC for speed (Taker Fee)");
+        let (order_type, price, time_in_force) = (OrderType::Market, None, TimeInForce::IOC);
 
         // ✅ Pass symbol specs to order for precision validation
         let (qty_step, tick_size) = if let Some(ref specs) = self.current_specs {

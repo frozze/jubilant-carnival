@@ -75,9 +75,9 @@ pub struct StrategyEngine {
     is_momentum_trade: bool,
 
     // ✅ PERFORMANCE: Cache VWAP calculations (recalculate only on new tick)
-    cached_vwap_short: Option<Decimal>,  // 50-tick VWAP
-    cached_vwap_long: Option<Decimal>,   // 200-tick VWAP
-    cached_volatility: Option<f64>,      // 100-tick volatility
+    cached_vwap_short: Option<Decimal>, // 50-tick VWAP
+    cached_vwap_long: Option<Decimal>,  // 200-tick VWAP
+    // ⚡ PHASE 2: Removed cached_volatility (not needed without dynamic threshold)
     /// CRITICAL: Use tick counter instead of buffer.len()!
     /// RingBuffer.len() stays constant when full (300), so len-based
     /// invalidation would STOP working after 300 ticks!
@@ -124,7 +124,6 @@ impl StrategyEngine {
             // ✅ PERFORMANCE: Initialize VWAP cache
             cached_vwap_short: None,
             cached_vwap_long: None,
-            cached_volatility: None,
             tick_counter: 0,
             last_cache_update: 0,
             position_start_time: None,
@@ -350,7 +349,6 @@ impl StrategyEngine {
         // CRITICAL: Old symbol's VWAP would cause completely wrong calculations!
         self.cached_vwap_short = None;
         self.cached_vwap_long = None;
-        self.cached_volatility = None;
         self.tick_counter = 0;
         self.last_cache_update = 0;
     }
@@ -591,7 +589,6 @@ impl StrategyEngine {
         if self.tick_counter != self.last_cache_update {
             self.cached_vwap_short = None;
             self.cached_vwap_long = None;
-            self.cached_volatility = None;
             self.last_cache_update = self.tick_counter;
         }
 
@@ -744,15 +741,11 @@ impl StrategyEngine {
 
         // Calculate momentum
         if let Some(momentum) = self.calculate_momentum() {
-            // Check entry conditions: deviation from VWAP exceeds threshold
+            // ⚡ PHASE 2: SIMPLIFIED - Fixed threshold, no dynamic scaling
+            // Old logic scaled threshold by volatility (1x-3x) - too complex
+            // Now: Simple fixed threshold = predictable behavior
             
-            // ✅ DYNAMIC THRESHOLD: Scale threshold by volatility
-            // If volatility (e.g. 1.0%) is higher than base (0.2%), increase threshold
-            let volatility = self.cached_volatility.unwrap_or(0.0) * 100.0;
-            let multiplier = (volatility / 0.2).max(1.0).min(3.0); // Cap at 3x
-            let dynamic_threshold = self.momentum_threshold * multiplier;
-
-            if momentum.abs() > dynamic_threshold {
+            if momentum.abs() > self.momentum_threshold {
                 // ⚡ PHASE 1 STABILIZATION: MOMENTUM ONLY
                 // Removed MeanReversion - too complex, contradicts Momentum logic
                 // Simple and fast: Trade WITH the trend
@@ -926,97 +919,9 @@ impl StrategyEngine {
         Some(momentum)
     }
 
-    /// ✅ ATR-BASED: Calculate tick volatility (standard deviation of price changes)
-    /// Uses last 100 ticks to measure market "choppiness"
-    fn calculate_volatility(&self) -> Option<f64> {
-        // Need at least 100 ticks for reliable volatility measurement
-        if self.tick_buffer.len() < 100 {
-            return None;
-        }
-
-        // Calculate price changes (returns) for last 100 ticks
-        // ✅ OPTIMIZATION: Collect from iter_rev() directly, avoiding full buffer clone
-        let recent_ticks: Vec<&TradeTick> = self.tick_buffer.iter_rev().take(100).collect();
-        // Note: iter_rev gives newest first: t0 (now), t-1, t-2...
-        // Iterating 0..len-1 means: change = (p[i] - p[i+1]) / p[i+1]
-        // i=0 is newest, i+1 is older. This matches "current - prev".
-        
-        let mut price_changes: Vec<f64> = Vec::with_capacity(99);
-
-        for i in 0..recent_ticks.len() - 1 {
-            let current_price = recent_ticks[i].price.to_f64().unwrap_or(0.0);
-            let prev_price = recent_ticks[i + 1].price.to_f64().unwrap_or(0.0);
-
-            if prev_price > 0.0 {
-                let change = (current_price - prev_price).abs() / prev_price;
-                price_changes.push(change);
-            }
-        }
-
-        if price_changes.is_empty() {
-            return None;
-        }
-
-        // Calculate mean
-        let mean: f64 = price_changes.iter().sum::<f64>() / price_changes.len() as f64;
-
-        // Calculate standard deviation
-        let variance: f64 = price_changes
-            .iter()
-            .map(|x| {
-                let diff = x - mean;
-                diff * diff
-            })
-            .sum::<f64>()
-            / price_changes.len() as f64;
-
-        let std_dev = variance.sqrt();
-
-        Some(std_dev)
-    }
-
-    /// ✅ ATR-BASED: Calculate dynamic Stop Loss based on volatility
-    /// Returns: (stop_loss_percent, take_profit_percent)
-    fn calculate_dynamic_risk(&self) -> (f64, f64) {
-        const MIN_SL_PERCENT: f64 = 0.7; // 0.7% minimum SL
-        const MAX_SL_PERCENT: f64 = 3.0; // 3.0% maximum SL
-        const VOLATILITY_MULTIPLIER: f64 = 2.0; // SL = 2x volatility
-        const TP_MULTIPLIER: f64 = 1.5; // TP = 1.5x SL (positive R:R)
-
-        let volatility = match self.calculate_volatility() {
-            Some(vol) => vol * 100.0, // Convert to percentage
-            None => {
-                // ✅ FIX BUG #29: Ensure config fallback is safe
-                let fallback_sl = self.config.stop_loss_percent.max(MIN_SL_PERCENT);
-                let fallback_tp = self.config.take_profit_percent.max(fallback_sl * TP_MULTIPLIER);
-
-                if self.config.stop_loss_percent < MIN_SL_PERCENT {
-                    warn!(
-                        "⚠️  Config SL {:.2}% too low, using minimum {:.2}%",
-                        self.config.stop_loss_percent, MIN_SL_PERCENT
-                    );
-                }
-
-                return (fallback_sl, fallback_tp);
-            }
-        };
-
-        // Calculate dynamic SL based on volatility
-        let dynamic_sl = volatility * VOLATILITY_MULTIPLIER;
-
-        // Clamp to min/max range
-        let clamped_sl = dynamic_sl.max(MIN_SL_PERCENT).min(MAX_SL_PERCENT);
-
-        // Calculate TP as multiple of SL
-        let dynamic_tp = clamped_sl * TP_MULTIPLIER;
-
-        debug!(
-            "📊 Dynamic Risk: Volatility={:.3}%, SL={:.2}% (raw={:.2}%), TP={:.2}%",
-            volatility, clamped_sl, dynamic_sl, dynamic_tp
-        );
-
-        (clamped_sl, dynamic_tp)
-    }
+    // ⚡ PHASE 2: Removed calculate_volatility() and calculate_dynamic_risk()
+    // These functions are no longer used after Phase 1 fixed SL/TP (0.35%/0.70%)
+    // Keeping this comment for history - they're in git if needed
 
     /// ✅ ANTI-FOMO: Calculate distance from current price to long-term VWAP (CACHED)
     /// Returns: distance as percentage (positive = above VWAP, negative = below)

@@ -86,6 +86,20 @@ pub struct StrategyEngine {
     
     // ✅ TIME-BASED EXIT
     position_start_time: Option<Instant>,
+
+    // ⚡ PHASE 3: CIRCUIT BREAKER - API Error Protection
+    /// Count of consecutive API errors (reset on success)
+    api_error_count: u32,
+    /// When the last API error occurred
+    last_api_error_time: Option<Instant>,
+    /// Whether trading is paused due to circuit breaker
+    is_paused: bool,
+
+    // ⚡ PHASE 3: DYNAMIC BLACKLIST - Prevent revenge trading
+    /// Track consecutive losses per symbol for temporary blacklist
+    symbol_consecutive_losses: std::collections::HashMap<String, u32>,
+    /// Temporarily blacklisted symbols with blacklist start time
+    temp_blacklist: std::collections::HashMap<String, Instant>,
 }
 
 impl StrategyEngine {
@@ -127,6 +141,12 @@ impl StrategyEngine {
             tick_counter: 0,
             last_cache_update: 0,
             position_start_time: None,
+            // ⚡ PHASE 3: Initialize Circuit Breaker and Blacklist
+            api_error_count: 0,
+            last_api_error_time: None,
+            is_paused: false,
+            symbol_consecutive_losses: std::collections::HashMap::new(),
+            temp_blacklist: std::collections::HashMap::new(),
         }
     }
 
@@ -561,6 +581,16 @@ impl StrategyEngine {
     }
 
     async fn handle_trade(&mut self, tick: TradeTick) {
+
+        // ⚡ PHASE 3: CIRCUIT BREAKER - Check if trading is paused
+        self.check_pause_status();
+        if self.is_paused { return; }
+
+        // ⚡ PHASE 3: Check temporary blacklist
+        if let Some(ref symbol) = self.current_symbol {
+            if self.is_temp_blacklisted(&symbol.0) { return; }
+        }
+
         // ✅ FIXED: Prevent race condition - ignore messages from old symbol
         if let Some(ref current_symbol) = self.current_symbol {
             if tick.symbol != *current_symbol {
@@ -917,6 +947,104 @@ impl StrategyEngine {
         let momentum = momentum_dec.to_f64().unwrap_or(0.0);
 
         Some(momentum)
+    }
+    // ⚡ PHASE 3: Circuit Breaker Methods
+
+    /// Handle API error - increment counter and pause trading if threshold reached
+    fn handle_api_error(&mut self) {
+        self.api_error_count += 1;
+        self.last_api_error_time = Some(Instant::now());
+
+        const MAX_API_ERRORS: u32 = 3;
+        
+        if self.api_error_count >= MAX_API_ERRORS {
+            error!(
+                "🔴 CIRCUIT BREAKER TRIGGERED: {} consecutive API errors",
+                self.api_error_count
+            );
+            error!("⏸️  Trading PAUSED for 60 seconds to prevent cascading failures");
+            self.is_paused = true;
+        } else {
+            warn!(
+                "⚠️  API Error #{}/{} - Trading continues",
+                self.api_error_count, MAX_API_ERRORS
+            );
+        }
+    }
+
+    /// Reset error counter on successful API call
+    fn reset_api_errors(&mut self) {
+        if self.api_error_count > 0 {
+            debug!("✅ API call successful - resetting error counter");
+            self.api_error_count = 0;
+            self.last_api_error_time = None;
+        }
+    }
+
+   /// Check if pause should be lifted (60s elapsed since last error)
+    fn check_pause_status(&mut self) {
+        if !self.is_paused {
+            return;
+        }
+
+        const PAUSE_DURATION_SECS: u64 = 60;
+
+        if let Some(last_error) = self.last_api_error_time {
+            let elapsed = last_error.elapsed().as_secs();
+            
+            if elapsed >= PAUSE_DURATION_SECS {
+                info!("✅ CIRCUIT BREAKER: 60s elapsed, RESUMING trading");
+                self.is_paused = false;
+                self.api_error_count = 0;
+                self.last_api_error_time = None;
+            } else {
+                let remaining = PAUSE_DURATION_SECS - elapsed;
+                debug!("⏸️  Still paused - {}s remaining", remaining);
+            }
+        }
+    }
+
+    /// Record a losing trade for dynamic blacklist
+    fn record_loss(&mut self, symbol: &str) {
+        *self.symbol_consecutive_losses.entry(symbol.to_string()).or_insert(0) += 1;
+        
+        const MAX_CONSECUTIVE_LOSSES: u32 = 2;
+        let losses = self.symbol_consecutive_losses[symbol];
+
+        if losses >= MAX_CONSECUTIVE_LOSSES {
+            warn!(
+                "⚠️  TEMP BLACKLIST: {} ({} consecutive losses) - paused for 2 hours",
+                symbol, losses
+            );
+            self.temp_blacklist.insert(symbol.to_string(), Instant::now());
+        }
+    }
+
+    /// Reset loss counter on winning trade
+    fn reset_losses(&mut self, symbol: &str) {
+        if self.symbol_consecutive_losses.contains_key(symbol) {
+            debug!("✅ Win! Resetting loss counter for {}", symbol);
+            self.symbol_consecutive_losses.remove(symbol);
+        }
+    }
+
+    /// Check if symbol is temporarily blacklisted
+    fn is_temp_blacklisted(&self, symbol: &str) -> bool {
+        const BLACKLIST_DURATION_HOURS: u64 = 2;
+
+        if let Some(blacklisted_at) = self.temp_blacklist.get(symbol) {
+            let elapsed_secs = blacklisted_at.elapsed().as_secs();
+            let is_still_blacklisted = elapsed_secs < (BLACKLIST_DURATION_HOURS * 3600);
+            
+            if is_still_blacklisted {
+                let remaining_hours = (BLACKLIST_DURATION_HOURS * 3600 - elapsed_secs) / 3600;
+                debug!("🚫 {} is blacklisted ({} hours remaining)", symbol, remaining_hours);
+            }
+            
+            is_still_blacklisted
+        } else {
+            false
+        }
     }
 
     // ⚡ PHASE 2: Removed calculate_volatility() and calculate_dynamic_risk()
